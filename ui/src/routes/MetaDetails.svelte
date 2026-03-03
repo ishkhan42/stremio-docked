@@ -54,6 +54,7 @@
       for (const addon of mAddons) {
         try {
           const result = await fetchMeta(addon, type, id);
+          if (result?.meta) { meta = result.meta; break; }
           if (result) { meta = result; break; }
         } catch (_) {}
       }
@@ -81,16 +82,16 @@
       sAddons.map(a => fetchStreams(a, type, videoId))
     );
     streams = streamResults
-      .filter(r => r.status === 'fulfilled' && r.value)
-      .flatMap(r => r.value);
+      .filter(r => r.status === 'fulfilled' && Array.isArray(r.value?.streams))
+      .flatMap(r => r.value.streams);
 
     // Parallel: subtitles from all subtitle addons
     const subResults = await Promise.allSettled(
       stAddons.map(a => fetchSubtitles(a, type, videoId, {}))
     );
     subtitles = subResults
-      .filter(r => r.status === 'fulfilled' && r.value)
-      .flatMap(r => r.value);
+      .filter(r => r.status === 'fulfilled' && Array.isArray(r.value?.subtitles))
+      .flatMap(r => r.value.subtitles);
 
     loadingStreams = false;
   }
@@ -133,7 +134,7 @@
       metaPoster:     meta?.poster || '',
       type,
       videoId:        vidId,
-      resumePos:      prog?.time || 0,
+      resumePos:      prog?.position || 0,
       subtitleTracks: subtitles.map(s => ({
         lang:  s.lang || s.id || 'und',
         label: s.lang || s.id || 'Unknown',

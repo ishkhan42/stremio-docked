@@ -53,8 +53,9 @@
     // Deduplicate by id
     const seen = new Set();
     results = searchResults
-      .filter(r => r.status === 'fulfilled' && Array.isArray(r.value))
-      .flatMap(r => r.value)
+      .filter(r => r.status === 'fulfilled' && Array.isArray(r.value?.metas))
+      .flatMap(r => r.value.metas)
+      .map(item => ({ ...item, type: item.type || 'movie' }))
       .filter(item => {
         if (!item?.id) return false;
         if (seen.has(item.id)) return false;

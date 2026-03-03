@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { push }    from 'svelte-spa-router';
-  import { catalogRows, loadAddons } from '../stores/addons.js';
+  import { addons, catalogRows, loadAddons } from '../stores/addons.js';
   import { authKey }  from '../stores/auth.js';
   import { getContinueItems } from '../stores/progress.js';
   import HeroBanner   from '../components/HeroBanner.svelte';
@@ -39,26 +39,28 @@
 
 <div class="board">
   <!-- Hero banner (uses first catalog row to source featured items) -->
-  <HeroBanner />
+  <HeroBanner addons={$addons} />
 
-  <!-- Continue Watching -->
-  {#if loadingContinue}
-    <!-- skeleton placeholder handled inside row -->
-  {:else if continueItems.length > 0}
-    <div class="section">
-      <h2 class="section-title">Continue Watching</h2>
+  <!-- My Library / Recently Played -->
+  <div class="section">
+    <h2 class="section-title">My Library · Recently Played</h2>
+    {#if loadingContinue}
+      <div class="library-empty">Loading recent activity…</div>
+    {:else if continueItems.length > 0}
       <div class="card-grid continue-grid">
         {#each continueItems as item}
           <MetaCard
             meta={item}
-            progress={item._progress}
-            width={180}
+            size="normal"
+            defaultType={item.type || 'movie'}
             on:click={() => goToMeta(item)}
           />
         {/each}
       </div>
-    </div>
-  {/if}
+    {:else}
+      <div class="library-empty">No recent playback yet. Start watching a title and it will appear here.</div>
+    {/if}
+  </div>
 
   <!-- Addon catalog rows -->
   {#if boardError}
@@ -69,12 +71,7 @@
   {:else}
     {#each $catalogRows as row}
       <CatalogRow
-        title={row.name}
-        type={row.type}
-        addonId={row.addonId}
-        catalogId={row.id}
-        extra={row.extra}
-        on:select={e => goToMeta(e.detail)}
+        {row}
       />
     {/each}
 
@@ -123,6 +120,12 @@
     scrollbar-width: none;
   }
   .continue-grid::-webkit-scrollbar { display: none; }
+
+  .library-empty {
+    padding: 14px 2px;
+    color: var(--text-dim);
+    font-size: 0.88rem;
+  }
 
   .board-error {
     display: flex;

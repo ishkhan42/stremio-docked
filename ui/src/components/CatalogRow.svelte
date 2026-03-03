@@ -49,7 +49,7 @@
           <p class="row-error">Failed to load</p>
         {:else}
           {#each metas as meta (meta.id)}
-            <MetaCard {meta} size={featured ? 'large' : 'normal'} />
+            <MetaCard {meta} size={featured ? 'large' : 'normal'} defaultType={row.type} />
           {/each}
         {/if}
       </div>

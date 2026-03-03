@@ -4,12 +4,14 @@
 
   export let meta;
   export let size = 'normal'; // 'normal' | 'large' | 'small'
+  export let defaultType = 'movie';
 
-  $: progress = getProgress(meta.type, meta.id);
+  $: resolvedType = meta?.type || defaultType;
+  $: progress = getProgress(resolvedType, meta.id);
   $: progressPct = progress ? Math.min((progress.position / progress.duration) * 100, 100) : 0;
 
   function navigate() {
-    push(`/meta/${meta.type}/${meta.id}`);
+    push(`/meta/${resolvedType}/${meta.id}`);
   }
 
   $: posterSrc = meta.poster
@@ -57,7 +59,7 @@
     </div>
 
     <!-- Type badge -->
-    {#if meta.type === 'series'}
+    {#if resolvedType === 'series'}
       <span class="type-badge">Series</span>
     {/if}
   </div>
