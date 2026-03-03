@@ -30,7 +30,7 @@ STREMIO_PID=$!
 
 # Wait for stremio-server to be ready (up to 30s)
 for i in $(seq 1 30); do
-  if curl -sf http://127.0.0.1:11470/status >/dev/null 2>&1; then
+  if curl -sf http://127.0.0.1:11470/local-addon/manifest.json >/dev/null 2>&1; then
     echo "stremio-server is ready."
     break
   fi

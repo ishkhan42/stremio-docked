@@ -52,9 +52,9 @@ export function saveProgress(type, videoId, position, duration, meta = {}) {
         position,
         duration,
         updatedAt: Date.now(),
-        name:   meta.name   || existing.name,
+        name: meta.name || existing.name,
         poster: meta.poster || existing.poster,
-        id:     videoId,
+        id: videoId,
         type,
     });
 }

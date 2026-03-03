@@ -123,7 +123,7 @@ app.get('/addons', async (req, res) => {
         const data = await stremioApiCall('/api/addonCollectionGet', {
             type: 'AddonCollectionGet',
             authKey,
-            addFromUrl: true,
+            update: false,
         });
 
         if (!data.result) throw new Error(data.error || 'Failed to fetch addons');
@@ -337,8 +337,15 @@ app.get('/image-proxy', async (req, res) => {
 
 app.get('/server-status', async (req, res) => {
     try {
-        const data = await fetchJson(`${STREMIO_SERVER}/status`, 3000);
-        res.json({ ok: true, server: data });
+        const manifest = await fetchJson(`${STREMIO_SERVER}/local-addon/manifest.json`, 3000);
+        res.json({
+            ok: true,
+            server: {
+                id: manifest?.id || 'org.stremio.local',
+                version: manifest?.version || null,
+                name: manifest?.name || 'Local addon',
+            },
+        });
     } catch (err) {
         res.json({ ok: false, error: err.message });
     }
