@@ -92,6 +92,44 @@ function normalizeLibraryItems(data) {
         }));
 }
 
+function normalizeStreamUrl(url, host) {
+    if (!url || typeof url !== 'string') return url;
+
+    const publicHost = host || '';
+    const localMediaPath = /^\/([a-f0-9]{40}|stream|hlsv2)\//i;
+
+    if (url.startsWith('/')) {
+        if (publicHost) {
+            return `${publicHost}/ss${url}`;
+        }
+        return `/ss${url}`;
+    }
+
+    try {
+        const parsed = new URL(url);
+        const isLocalServer =
+            parsed.hostname === '127.0.0.1' ||
+            parsed.hostname === 'localhost' ||
+            parsed.port === '11470';
+
+        const looksLikeLocalMedia = localMediaPath.test(parsed.pathname);
+
+        if ((isLocalServer || looksLikeLocalMedia) && publicHost) {
+            return `${publicHost}/ss${parsed.pathname}${parsed.search || ''}`;
+        }
+
+        return url;
+    } catch {
+        return url;
+    }
+}
+
+function extractHashFileFromPath(pathname = '') {
+    const match = pathname.match(/^\/([a-f0-9]{40})\/(\d+)(?:\/.*)?$/i);
+    if (!match) return null;
+    return { infoHash: match[1].toLowerCase(), fileIdx: Number(match[2]) || 0 };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth routes /auth/*
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,9 +320,34 @@ app.post('/stream-url', async (req, res) => {
         // ── 1. External HTTP stream ─────────────────────────────────────────
         if (stream.url) {
             // Some streams are externally hosted (HTTP direct links)
+            const normalizedUrl = normalizeStreamUrl(stream.url, host);
+            const isHls = /\.m3u8($|\?)/i.test(normalizedUrl);
+
+            // Some local stremio-server playlist URLs (e.g. /hash/idx/stream-1.m3u8)
+            // are not directly playable and return 404/warnings unless extra params are present.
+            // For these, route to direct file URL under /ss/<hash>/<idx>.
+            try {
+                const parsed = new URL(normalizedUrl, host || 'http://localhost');
+                const localMatch = extractHashFileFromPath(parsed.pathname);
+                const isLocalM3u8 = !!localMatch && /\/stream-\d+\.m3u8$/i.test(parsed.pathname);
+                if (isLocalM3u8 && localMatch) {
+                    const direct = `${host || ''}/ss/${localMatch.infoHash}/${localMatch.fileIdx}`;
+                    return res.json({
+                        url: direct,
+                        hlsUrl: null,
+                        infoHash: localMatch.infoHash,
+                        fileIdx: localMatch.fileIdx,
+                        type: 'torrent',
+                        canSeek: true,
+                    });
+                }
+            } catch {
+                // ignore parse failures and continue with normalized URL
+            }
+
             return res.json({
-                url: stream.url,
-                hlsUrl: stream.url.includes('.m3u8') ? stream.url : null,
+                url: normalizedUrl,
+                hlsUrl: isHls ? normalizedUrl : null,
                 type: 'http',
                 canSeek: true,
             });

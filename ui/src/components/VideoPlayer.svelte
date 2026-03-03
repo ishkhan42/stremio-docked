@@ -81,7 +81,8 @@
 
   // ── Player setup ──────────────────────────────────────────────────────────
   function setupPlayer() {
-    const url = streamUrl || directUrl;
+    const url = normalizePlayableUrl(streamUrl || directUrl);
+    const normalizedDirect = normalizePlayableUrl(directUrl);
     if (!url || !videoEl) return;
 
     errorMsg = '';
@@ -99,7 +100,7 @@
       videoEl.load();
     } else {
       // Try direct URL as fallback
-      videoEl.src = directUrl || url;
+      videoEl.src = normalizedDirect || url;
       videoEl.load();
     }
 
@@ -152,16 +153,25 @@
       if (data.fatal) {
         console.error('[hls.js] Fatal error:', data);
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          hls.startLoad();
+          const normalizedDirect = normalizePlayableUrl(directUrl);
+          if (normalizedDirect && normalizedDirect !== url) {
+            console.log('[player] HLS network error, falling back to direct URL');
+            cleanupHls();
+            videoEl.src = normalizedDirect;
+            videoEl.load();
+            videoEl.play().catch(() => {});
+          } else {
+            errorMsg = 'Network error while loading stream.';
+          }
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
           hls.recoverMediaError();
         } else {
           // Fall back to direct URL
           hlsFailed = true;
-          if (directUrl && directUrl !== url) {
+          if (normalizedDirect && normalizedDirect !== url) {
             console.log('[player] HLS failed, falling back to direct URL');
             cleanupHls();
-            videoEl.src = directUrl;
+            videoEl.src = normalizedDirect;
             videoEl.load();
             videoEl.play().catch(() => {});
           } else {
@@ -212,15 +222,41 @@
     dispatch('ended');
   }
   function onError() {
-    if (!hlsFailed && directUrl && videoEl.src !== directUrl) {
+    const normalizedDirect = normalizePlayableUrl(directUrl);
+    if (!hlsFailed && normalizedDirect && videoEl.src !== normalizedDirect) {
       console.log('[player] Video error, fallback to direct URL');
       cleanupHls();
-      videoEl.src = directUrl;
+      videoEl.src = normalizedDirect;
       videoEl.load();
       videoEl.play().catch(() => {});
       return;
     }
     errorMsg = 'Cannot play this stream. Format may be unsupported by your browser.';
+  }
+
+  function normalizePlayableUrl(url) {
+    if (!url) return url;
+
+    const localMediaPath = /^\/([a-f0-9]{40}|stream|hlsv2)\//i;
+
+    try {
+      const base = window.location.origin;
+      const parsed = new URL(url, base);
+      const sameOrigin = parsed.origin === base;
+      const needsPrefix = localMediaPath.test(parsed.pathname) && !parsed.pathname.startsWith('/ss/');
+
+      if (needsPrefix && sameOrigin) {
+        return `${base}/ss${parsed.pathname}${parsed.search || ''}`;
+      }
+
+      if (needsPrefix && url.startsWith('/')) {
+        return `/ss${url}`;
+      }
+
+      return parsed.toString();
+    } catch {
+      return url;
+    }
   }
   function onFullscreenChange() {
     fullscreen = !!document.fullscreenElement;
