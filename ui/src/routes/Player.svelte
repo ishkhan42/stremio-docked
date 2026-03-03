@@ -1,7 +1,8 @@
 <script>
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import { pop, push } from 'svelte-spa-router';
   import VideoPlayer from '../components/VideoPlayer.svelte';
+  import { loadPlayerState, savePlayerState, clearPlayerState } from '../lib/storage.js';
 
   // Player state is passed via history.state from MetaDetails
   let playerState = null;
@@ -10,18 +11,26 @@
   onMount(() => {
     playerState = history.state;
     if (!playerState?.streamUrl && !playerState?.directUrl) {
+      playerState = loadPlayerState();
+    }
+
+    if (!playerState?.streamUrl && !playerState?.directUrl) {
       stateError = true;
+      return;
     }
 
     // Prevent browser back from exiting video unexpectedly
+    savePlayerState(playerState);
     history.replaceState(playerState, '');
   });
 
   function handleBack() {
+    clearPlayerState();
     pop();
   }
 
   function handleEnded() {
+    clearPlayerState();
     if (playerState?.hasNext && playerState?.nextEpisodeId) {
       // Next episode: pop back to meta page where user can pick next stream
       pop();

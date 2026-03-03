@@ -10,6 +10,7 @@
     fetchSubtitles,
   } from '../lib/addons.js';
   import { resolveStreamUrl, imageProxyUrl } from '../lib/api.js';
+  import { savePlayerState } from '../lib/storage.js';
   import EpisodeGrid    from '../components/EpisodeGrid.svelte';
   import StreamPicker   from '../components/StreamPicker.svelte';
 
@@ -145,6 +146,7 @@
     };
 
     // Pass state via history API, then navigate
+    savePlayerState(playerState);
     history.pushState(playerState, '');
     push('/player');
   }

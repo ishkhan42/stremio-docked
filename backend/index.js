@@ -62,6 +62,36 @@ async function fetchJson(url, timeoutMs = 10000) {
     }
 }
 
+function toNumber(value, fallback) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+function normalizeLibraryItems(data) {
+    const raw = Array.isArray(data?.result)
+        ? data.result
+        : Array.isArray(data)
+            ? data
+            : Array.isArray(data?.result?.items)
+                ? data.result.items
+                : [];
+
+    return raw
+        .filter(item => item && item._id && !item.removed)
+        .map(item => ({
+            id: item._id,
+            type: item.type || 'movie',
+            name: item.name || item._id,
+            poster: item.poster || '',
+            background: item.background || '',
+            year: item.year || '',
+            posterShape: item.posterShape || 'poster',
+            state: item.state || {},
+            updatedAt: item._mtime || item._ctime || null,
+            createdAt: item._ctime || null,
+        }));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth routes /auth/*
 // ─────────────────────────────────────────────────────────────────────────────
@@ -128,6 +158,71 @@ app.get('/addons', async (req, res) => {
 
         if (!data.result) throw new Error(data.error || 'Failed to fetch addons');
         res.json(data.result.addons || []);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Account synced library /library, /recently-played
+// Uses Stremio datastore collection: libraryItem
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/library', async (req, res) => {
+    try {
+        const { authKey, type = 'all' } = req.query;
+        const limit = Math.max(1, Math.min(500, toNumber(req.query.limit, 500)));
+
+        if (!authKey) return res.status(400).json({ error: 'Missing authKey' });
+
+        const data = await stremioApiCall('/api/datastoreGet', {
+            type: 'DatastoreGet',
+            authKey,
+            collection: 'libraryItem',
+            all: true,
+        });
+
+        let items = normalizeLibraryItems(data);
+        if (type !== 'all') {
+            items = items.filter(item => item.type === type);
+        }
+
+        items.sort((a, b) => {
+            const at = new Date(a.updatedAt || 0).getTime();
+            const bt = new Date(b.updatedAt || 0).getTime();
+            return bt - at;
+        });
+
+        res.json({ items: items.slice(0, limit) });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/recently-played', async (req, res) => {
+    try {
+        const { authKey } = req.query;
+        const limit = Math.max(1, Math.min(200, toNumber(req.query.limit, 30)));
+
+        if (!authKey) return res.status(400).json({ error: 'Missing authKey' });
+
+        const data = await stremioApiCall('/api/datastoreGet', {
+            type: 'DatastoreGet',
+            authKey,
+            collection: 'libraryItem',
+            all: true,
+        });
+
+        const items = normalizeLibraryItems(data)
+            .filter(item => item.state?.lastWatched)
+            .sort((a, b) => {
+                const at = new Date(a.state?.lastWatched || 0).getTime();
+                const bt = new Date(b.state?.lastWatched || 0).getTime();
+                return bt - at;
+            })
+            .slice(0, limit);
+
+        res.json({ items });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

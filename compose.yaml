@@ -6,7 +6,9 @@ services:
     ports:
       - "6080:8080"
     volumes:
-      - ./stremio-data:/root/.stremio-server
+      # - ./stremio-data:/root/.stremio-server
+      # Add named volume for stremio-server data to persist across container recreations
+      - stremio-vol:/root/.stremio-server
     # Optional: expose GPU for hardware-accelerated ffmpeg transcoding.
     # Comment out if your GPU is consistently busy with other workloads
     # and you prefer software transcoding via CPU.
@@ -17,3 +19,6 @@ services:
       - SERVER_HOST=192.168.20.214
       # Port nginx listens on
       - SERVER_PORT=8080
+
+volumes:
+  stremio-vol:

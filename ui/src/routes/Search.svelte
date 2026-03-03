@@ -12,6 +12,9 @@
   let debounceTimer;
   let inputEl;
 
+  $: groupedResults = groupByType(results);
+  $: groupedEntries = Object.entries(groupedResults);
+
   onMount(() => {
     inputEl?.focus();
   });
@@ -69,6 +72,34 @@
   function goToMeta(item) {
     push(`/meta/${item.type || 'movie'}/${item.id}`);
   }
+
+  function typeLabel(type) {
+    if (type === 'movie') return 'Movies';
+    if (type === 'series') return 'Series';
+    if (type === 'anime') return 'Anime';
+    if (type === 'channel') return 'Channels';
+    return (type || 'Other').charAt(0).toUpperCase() + (type || 'other').slice(1);
+  }
+
+  function typeOrder(type) {
+    if (type === 'movie') return 0;
+    if (type === 'series') return 1;
+    if (type === 'anime') return 2;
+    return 9;
+  }
+
+  function groupByType(items) {
+    const groups = {};
+    for (const item of items) {
+      const type = item?.type || 'other';
+      if (!groups[type]) groups[type] = [];
+      groups[type].push(item);
+    }
+
+    return Object.fromEntries(
+      Object.entries(groups).sort((a, b) => typeOrder(a[0]) - typeOrder(b[0]))
+    );
+  }
 </script>
 
 <div class="search-page">
@@ -123,15 +154,18 @@
       </div>
     {:else}
       <p class="result-count">{results.length} result{results.length !== 1 ? 's' : ''}</p>
-      <div class="results-grid">
-        {#each results as item (item.id)}
-          <MetaCard
-            meta={item}
-            width={160}
-            on:click={() => goToMeta(item)}
-          />
-        {/each}
-      </div>
+      {#each groupedEntries as [type, items]}
+        <h3 class="group-title">{typeLabel(type)} · {items.length}</h3>
+        <div class="results-grid">
+          {#each items as item (item.id)}
+            <MetaCard
+              meta={item}
+              width={160}
+              on:click={() => goToMeta(item)}
+            />
+          {/each}
+        </div>
+      {/each}
     {/if}
   </div>
 </div>
@@ -224,6 +258,14 @@
     display: flex;
     flex-wrap: wrap;
     gap: 16px;
+    margin-bottom: 18px;
+  }
+
+  .group-title {
+    font-size: 0.95rem;
+    color: var(--text-muted);
+    margin: 6px 0 10px;
+    letter-spacing: 0.2px;
   }
 
   /* ── Empty / Loading states ───────────────────────────────────────────────── */

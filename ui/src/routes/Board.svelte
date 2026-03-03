@@ -4,6 +4,7 @@
   import { addons, catalogRows, loadAddons } from '../stores/addons.js';
   import { authKey }  from '../stores/auth.js';
   import { getContinueItems } from '../stores/progress.js';
+  import { getRecentlyPlayed } from '../lib/api.js';
   import HeroBanner   from '../components/HeroBanner.svelte';
   import CatalogRow   from '../components/CatalogRow.svelte';
   import MetaCard     from '../components/MetaCard.svelte';
@@ -21,14 +22,30 @@
       boardError = 'Failed to load content. ' + e.message;
     }
 
-    // Load continue watching
-    const raw = getContinueItems();
-    continueItems = raw.map(item => ({
-      ...item,
-      id: item.videoId,
-      name: item.name || item.videoId,
-      _progress: item.duration > 0 ? Math.round((item.position / item.duration) * 100) : 0,
-    }));
+    try {
+      if ($authKey) {
+        const synced = await getRecentlyPlayed($authKey, 24);
+        continueItems = (synced.items || []).map(item => ({
+          ...item,
+          _progress: item?.state?.duration > 0
+            ? Math.round(((item.state.timeOffset || 0) / item.state.duration) * 100)
+            : 0,
+        }));
+      }
+    } catch (_) {
+      continueItems = [];
+    }
+
+    if (continueItems.length === 0) {
+      const raw = getContinueItems();
+      continueItems = raw.map(item => ({
+        ...item,
+        id: item.videoId,
+        name: item.name || item.videoId,
+        _progress: item.duration > 0 ? Math.round((item.position / item.duration) * 100) : 0,
+      }));
+    }
+
     loadingContinue = false;
   });
 

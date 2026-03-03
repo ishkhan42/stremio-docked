@@ -41,6 +41,18 @@ export async function getAddons(authKey) {
     return call(`/addons?authKey=${encodeURIComponent(authKey)}`);
 }
 
+export async function getLibrary(authKey, options = {}) {
+    const params = new URLSearchParams({ authKey });
+    if (options.type) params.set('type', options.type);
+    if (options.limit) params.set('limit', String(options.limit));
+    return call(`/library?${params.toString()}`);
+}
+
+export async function getRecentlyPlayed(authKey, limit = 20) {
+    const params = new URLSearchParams({ authKey, limit: String(limit) });
+    return call(`/recently-played?${params.toString()}`);
+}
+
 /**
  * Resolve a stremio stream descriptor to playable URLs.
  * @param {object} stream - Stremio stream object (infoHash, url, etc.)

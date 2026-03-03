@@ -8,6 +8,7 @@
   import MetaDetails from './routes/MetaDetails.svelte';
   import Player     from './routes/Player.svelte';
   import Search     from './routes/Search.svelte';
+  import Library    from './routes/Library.svelte';
   import Settings   from './routes/Settings.svelte';
 
   import NavBar from './components/NavBar.svelte';
@@ -18,6 +19,7 @@
   const routes = {
     '/':                  Board,
     '/search':            Search,
+    '/library':           Library,
     '/meta/:type/:id':    MetaDetails,
     '/player':            Player,
     '/settings':          Settings,

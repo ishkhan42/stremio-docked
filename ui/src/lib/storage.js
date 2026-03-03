@@ -42,6 +42,20 @@ export function clearAuth() {
     remove('auth');
 }
 
+// ── Player state handoff ────────────────────────────────────────────────────
+
+export function savePlayerState(state) {
+    set('player_state', state);
+}
+
+export function loadPlayerState() {
+    return get('player_state', null);
+}
+
+export function clearPlayerState() {
+    remove('player_state');
+}
+
 // ── Watch progress ────────────────────────────────────────────────────────────
 // Key: `progress_${type}_${videoId}` → { position, duration, updatedAt }
 
