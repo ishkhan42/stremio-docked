@@ -33,6 +33,20 @@
   // Episode selection (series)
   let selectedEpisode = null;  // { videoId, title, season, episode, thumbnail }
 
+  // Build a map of episode videoId → progress % for EpisodeGrid
+  $: watchedMap = (() => {
+    if (!meta?.videos?.length) return {};
+    const map = {};
+    for (const v of meta.videos) {
+      if (!v.id) continue;
+      const prog = getProgress('series', v.id);
+      if (prog?.duration > 0) {
+        map[v.id] = Math.round((prog.position / prog.duration) * 100);
+      }
+    }
+    return map;
+  })();
+
   // Subtitles for stream
   let subtitles  = [];
 
@@ -267,14 +281,14 @@
 
           <!-- Resume button if progress exists -->
           {#if type === 'movie'}
-            {#if getProgress('movie', id)?.time > 30}
+            {#if getProgress('movie', id)?.position > 30}
               <button
                 class="btn-secondary"
                 data-focusable="true"
                 on:click={() => { handlePlayMovie(); }}
               >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                Resume {Math.floor(getProgress('movie', id)?.time / 60)}m
+                Resume {Math.floor(getProgress('movie', id)?.position / 60)}m
               </button>
             {/if}
           {/if}
@@ -287,6 +301,7 @@
       <div class="episodes-section">
         <EpisodeGrid
           videos={meta.videos}
+          watchedMap={watchedMap}
           title={meta.name}
           on:select={handleEpisodeSelect}
         />

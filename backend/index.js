@@ -329,12 +329,19 @@ app.post('/stream-url', async (req, res) => {
             try {
                 const parsed = new URL(normalizedUrl, host || 'http://localhost');
                 const localMatch = extractHashFileFromPath(parsed.pathname);
-                const isLocalM3u8 = !!localMatch && /\/stream-\d+\.m3u8$/i.test(parsed.pathname);
-                if (isLocalM3u8 && localMatch) {
-                    const direct = `${host || ''}/ss/${localMatch.infoHash}/${localMatch.fileIdx}`;
+                // Any local stremio-server media path (stream-N.m3u8, direct hash URL, etc.)
+                // Route to the master.m3u8 so hls.js can expose multi-audio and subtitle tracks.
+                if (localMatch) {
+                    const base = `${host || ''}/ss/${localMatch.infoHash}/${localMatch.fileIdx}`;
+                    const direct = base;
+                    const hlsUrl = `${base}/master.m3u8`;
+                    // Warm-up ping
+                    fetch(`http://127.0.0.1:11470/${localMatch.infoHash}/${localMatch.fileIdx}`, {
+                        method: 'HEAD', signal: AbortSignal.timeout(2000),
+                    }).catch(() => { });
                     return res.json({
                         url: direct,
-                        hlsUrl: null,
+                        hlsUrl,
                         infoHash: localMatch.infoHash,
                         fileIdx: localMatch.fileIdx,
                         type: 'torrent',
