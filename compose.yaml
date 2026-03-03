@@ -1,0 +1,19 @@
+services:
+  stremio-docked:
+    build: .
+    container_name: stremio-docked
+    restart: unless-stopped
+    ports:
+      - "6080:8080"
+    volumes:
+      - ./stremio-data:/root/.stremio-server
+    # Optional: expose GPU for hardware-accelerated ffmpeg transcoding.
+    # Comment out if your GPU is consistently busy with other workloads
+    # and you prefer software transcoding via CPU.
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      # LAN IP of this machine – reachable by the TV
+      - SERVER_HOST=192.168.20.214
+      # Port nginx listens on
+      - SERVER_PORT=8080

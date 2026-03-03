@@ -1,0 +1,10 @@
+{
+    "serverUrl": "http://127.0.0.1:11470/",
+    "streamingServerUrl": "http://127.0.0.1:11470/",
+    "casting-disabled": "true",
+    "hardwareDecoding": true,
+    "streamingTranscodingProfile": "high",
+    "audioPassthrough": false,
+    "subtitlesLanguage": "eng",
+    "audioLanguage": "eng"
+}
