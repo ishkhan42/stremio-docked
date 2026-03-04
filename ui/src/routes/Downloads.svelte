@@ -200,6 +200,7 @@
       videoId: item.videoId || `${item.type || 'movie'}:${infoHash}:${fileIdx}`,
       resumePos: 0,
       subtitleTracks: subtitles,
+      isDownloaded: true,
       hasNext: false,
       nextEpisodeId: null,
     };

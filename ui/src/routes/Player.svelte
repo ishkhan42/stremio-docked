@@ -60,6 +60,7 @@
     metaId={playerState.metaId || ''}
     videoId={playerState.videoId}
     resumePos={playerState.resumePos}
+    isDownloaded={!!playerState.isDownloaded}
     subtitleTracks={playerState.subtitleTracks || []}
     hasNext={playerState.hasNext}
     on:back={handleBack}

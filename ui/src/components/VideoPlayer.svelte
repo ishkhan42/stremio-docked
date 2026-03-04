@@ -11,6 +11,7 @@
     startStreamPrefetch,
     stopStreamPrefetch,
     getStreamPrefetchStatus,
+    getDownloads,
     startBackgroundDownload,
     syncRecentlyPlayed,
   } from '../lib/api.js';
@@ -73,6 +74,7 @@
   export let metaId         = '';
   export let videoId        = '';
   export let resumePos      = 0;
+  export let isDownloaded   = false;
   export let hasNext        = false;
   export let metaName       = '';
   export let metaPoster     = '';
@@ -103,11 +105,15 @@
   let lastObservedMediaTime = 0;
   let stalledTicks = 0;
   let lastRecoveryAt = 0;
+  let lastRecoveryMediaTime = -1;
+  let recoveryStep = 0;
   let lastProgressAt = 0;
   let stallHintAt = 0;
   let prefetchSessionId = '';
   let prefetchStats = null;
   let prefetchPollTimer;
+  let inferredDownloaded = false;
+  let downloadStatusChecked = false;
   let backgroundDownloadBusy = false;
   let backgroundDownloadQueued = false;
   let lastSyncedAt = 0;
@@ -178,6 +184,8 @@
   $: prefetchSummary = prefetchStats
     ? `${formatBytes(prefetchStats.bytesDownloaded)}${prefetchStats.totalBytes > 0 ? ` / ${formatBytes(prefetchStats.totalBytes)}` : ''}`
     : '';
+  $: effectiveDownloaded = !!isDownloaded || inferredDownloaded;
+  $: prefetchPolicy = effectiveDownloaded ? 'disabled' : 'enabled';
   $: downloadBtnLabel = backgroundDownloadBusy
     ? 'Starting…'
     : backgroundDownloadQueued
@@ -238,6 +246,7 @@
   onMount(() => {
     document.addEventListener('keydown', handleKey, { capture: true });
     document.addEventListener('fullscreenchange', onFullscreenChange);
+    hydrateDownloadedState();
     setupPlayer();
 
     // In parallel: fetch track info via ffprobe if it's a torrent stream
@@ -602,19 +611,28 @@
     stopStallWatchdog();
     syncPlaybackProgress(true);
   }
-  function onWaiting() { buffering = true; }
+  function onWaiting() {
+    buffering = true;
+    if (!videoEl || usingHls || audioSwitchSession) return;
+    const classification = classifyStall();
+    if (classification === 'decode-gap' || !canStartPrefetch()) {
+      attemptStallRecovery('waiting');
+    } else if (classification === 'network-starvation') {
+      startPrefetch();
+    }
+  }
   function onPlaying() {
     buffering = false;
     playing = true;
     clearTimeout(switchRollbackTimer);
     startStallWatchdog();
-    startPrefetch();
+    if (canStartPrefetch()) startPrefetch();
   }
 
   function onStalled() {
     buffering = true;
     const classification = classifyStall();
-    if (classification === 'decode-gap') {
+    if (classification === 'decode-gap' || !canStartPrefetch()) {
       attemptStallRecovery('stalled');
     } else if (classification === 'network-starvation') {
       maybeShowStallHint('Buffer underrun detected. Waiting for network/data…');
@@ -638,13 +656,16 @@
       if (advanced) {
         lastObservedMediaTime = mediaTime;
         stalledTicks = 0;
+        if (lastRecoveryMediaTime >= 0 && mediaTime > lastRecoveryMediaTime + 0.6) {
+          recoveryStep = 0;
+        }
         return;
       }
 
       stalledTicks += 1;
       if (stalledTicks >= 4) {
         const classification = classifyStall();
-        if (classification === 'decode-gap') {
+        if (classification === 'decode-gap' || !canStartPrefetch()) {
           attemptStallRecovery('watchdog');
         } else if (classification === 'network-starvation') {
           maybeShowStallHint('Network starvation detected. Prefetching ahead…');
@@ -666,14 +687,35 @@
     const network = videoEl.networkState;
     const ahead = bufferedAhead;
     const recentProgress = (now - lastProgressAt) < 3000;
+    const allowPrefetch = canStartPrefetch();
+    let gapToNextBuffered = Number.POSITIVE_INFINITY;
+
+    if (videoEl.buffered?.length) {
+      const cur = videoEl.currentTime || 0;
+      for (let i = 0; i < videoEl.buffered.length; i++) {
+        const start = videoEl.buffered.start(i);
+        if (start > cur) {
+          gapToNextBuffered = Math.min(gapToNextBuffered, start - cur);
+        }
+      }
+    }
 
     // Data available ahead, but playhead doesn't move: likely timestamp/decode issue.
-    if (ahead >= 1.5 && (ready >= 3 || recentProgress)) {
+    if (ahead >= 0.6 && (ready >= 3 || recentProgress)) {
+      return 'decode-gap';
+    }
+
+    // Tiny discontinuity in buffered ranges at current position is a decode/timeline gap.
+    if (Number.isFinite(gapToNextBuffered) && gapToNextBuffered > 0 && gapToNextBuffered <= 1.6) {
+      return 'decode-gap';
+    }
+
+    if (!allowPrefetch && (ahead > 0 || Number.isFinite(gapToNextBuffered))) {
       return 'decode-gap';
     }
 
     // Little/no buffered data and no recent network fill: likely starvation.
-    if (ahead <= 0.4 && (network === 2 || !recentProgress || ready <= 2)) {
+    if (allowPrefetch && ahead <= 0.4 && (network === 2 || !recentProgress || ready <= 2)) {
       return 'network-starvation';
     }
 
@@ -692,11 +734,16 @@
     if (videoEl.paused || videoEl.seeking) return;
 
     const now = Date.now();
-    if (now - lastRecoveryAt < 4500) return;
+    if (now - lastRecoveryAt < 1400) return;
     lastRecoveryAt = now;
 
     const current = videoEl.currentTime || 0;
-    let target = current + 0.12;
+    const sameRegion = Math.abs(current - lastRecoveryMediaTime) < 0.8;
+    recoveryStep = sameRegion ? Math.min(recoveryStep + 1, 4) : 0;
+    lastRecoveryMediaTime = current;
+
+    const hopByStep = [0.18, 0.45, 0.9, 1.5, 2.2][recoveryStep] || 0.45;
+    let target = current + hopByStep;
 
     // If we are exactly at a buffered range end, hop over tiny discontinuity.
     if (videoEl.buffered?.length > 1) {
@@ -704,7 +751,7 @@
         const end = videoEl.buffered.end(i);
         const nextStart = videoEl.buffered.start(i + 1);
         if (Math.abs(current - end) < 0.12 && nextStart - end < 1.0) {
-          target = Math.max(target, nextStart + 0.04);
+          target = Math.max(target, nextStart + 0.08);
           break;
         }
       }
@@ -715,8 +762,12 @@
         const start = videoEl.buffered.start(i);
         const end = videoEl.buffered.end(i);
         if (current >= start && current <= end) {
-          if (end - current < 0.15) {
-            target = Math.max(target, end + 0.05);
+          const roomAhead = Math.max(0, end - current);
+          if (roomAhead < 0.2) {
+            target = Math.max(target, end + 0.08);
+          } else {
+            // Stay within buffered window to avoid forcing a network stall.
+            target = Math.min(target, end - 0.03);
           }
           break;
         }
@@ -730,14 +781,15 @@
     if (target > current + 0.01) {
       videoEl.currentTime = target;
       buffering = true;
+      videoEl.play().catch(() => {});
       showStatusHint(source === 'stalled'
-        ? 'Decode gap detected. Applying tiny timeline nudge…'
-        : 'Likely decode/timestamp stall. Auto-recovering gently…');
+        ? 'Decode gap detected. Auto-hopping to next keyframe…'
+        : 'Timeline discontinuity detected. Applying smart skip…');
     }
   }
 
   async function startPrefetch() {
-    if (!infoHash || usingHls || audioSwitchSession) return;
+    if (!canStartPrefetch()) return;
     if (prefetchSessionId) {
       startPrefetchPolling();
       return;
@@ -759,6 +811,39 @@
       }
     } catch (err) {
       console.warn('[player] prefetch start failed:', err.message);
+    }
+  }
+
+  function canStartPrefetch() {
+    return !!infoHash && !effectiveDownloaded && !usingHls && !audioSwitchSession;
+  }
+
+  async function hydrateDownloadedState() {
+    if (!infoHash || isDownloaded || downloadStatusChecked) return;
+    try {
+      const response = await getDownloads();
+      const items = Array.isArray(response?.items) ? response.items : [];
+      const hash = String(infoHash || '').toLowerCase();
+      const idx = Number(fileIdx || 0);
+      const match = items.find((item) =>
+        String(item?.infoHash || '').toLowerCase() === hash && Number(item?.fileIdx || 0) === idx
+      );
+      if (!match) return;
+
+      const progress = Number(match.progress || 0);
+      const totalBytes = Number(match.totalBytes || 0);
+      const doneByBytes = totalBytes > 0 && Number(match.bytesDownloaded || 0) >= totalBytes * 0.995;
+      const doneByStatus = ['done', 'completed'].includes(String(match.status || '').toLowerCase());
+      if (doneByStatus || progress >= 99.5 || doneByBytes) {
+        inferredDownloaded = true;
+        if (prefetchSessionId) {
+          stopPrefetch();
+        }
+      }
+    } catch {
+      // best-effort detection only
+    } finally {
+      downloadStatusChecked = true;
     }
   }
 
@@ -1197,8 +1282,10 @@
     if (matchKey(e, 'ENTER') || matchKey(e, 'PLAY')) { e.preventDefault(); e.stopImmediatePropagation(); togglePlay(); return; }
     if (matchKey(e, 'FF'))   { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(30);  return; }
     if (matchKey(e, 'RW'))   { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(-30); return; }
-    if (matchKey(e, 'RIGHT') && !activePanel) { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(10);  return; }
-    if (matchKey(e, 'LEFT')  && !activePanel) { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(-10); return; }
+    const seekForwardKey = matchKey(e, 'RIGHT') || e.key === '>' || (e.code === 'Period' && e.shiftKey);
+    const seekBackwardKey = matchKey(e, 'LEFT') || e.key === '<' || (e.code === 'Comma' && e.shiftKey);
+    if (seekForwardKey && !activePanel) { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(5);  return; }
+    if (seekBackwardKey && !activePanel) { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(-5); return; }
     if (matchKey(e, 'UP'))   { e.preventDefault(); e.stopImmediatePropagation(); setVolume(volume + 0.1); return; }
     if (matchKey(e, 'DOWN')) { e.preventDefault(); e.stopImmediatePropagation(); setVolume(volume - 0.1); return; }
     if (matchKey(e, 'BACK')) {
@@ -1344,6 +1431,8 @@
               {#if prefetchStats.speedBps}
                 <p><b>Rate:</b> {formatRate(prefetchStats.speedBps)}</p>
               {/if}
+            {:else if effectiveDownloaded}
+              <p><b>Prefetch:</b> disabled (downloaded source)</p>
             {/if}
             {#if statusHint}<p><b>Note:</b> {statusHint}</p>{/if}
           </div>
@@ -1405,14 +1494,14 @@
       <!-- Button row -->
       <div class="btn-row">
         <div class="btn-grp">
-          <!-- -30s -->
+          <!-- -5s -->
           <button class="icon-btn skip-btn" data-focusable="true"
-            on:click|stopPropagation={() => seekRelative(-30)} title="-30s">
+            on:click|stopPropagation={() => seekRelative(-5)} title="-5s">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M11 17a6 6 0 1 1 0-10.66"/>
               <path d="M11 17V7l-4 4"/>
             </svg>
-            <span class="skip-lbl">30</span>
+            <span class="skip-lbl">5</span>
           </button>
 
           <!-- Play / Pause -->
@@ -1429,14 +1518,14 @@
             {/if}
           </button>
 
-          <!-- +30s -->
+          <!-- +5s -->
           <button class="icon-btn skip-btn" data-focusable="true"
-            on:click|stopPropagation={() => seekRelative(30)} title="+30s">
+            on:click|stopPropagation={() => seekRelative(5)} title="+5s">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M13 17a6 6 0 1 0 0-10.66"/>
               <path d="M13 17V7l4 4"/>
             </svg>
-            <span class="skip-lbl">30</span>
+            <span class="skip-lbl">5</span>
           </button>
 
           <!-- Volume -->
