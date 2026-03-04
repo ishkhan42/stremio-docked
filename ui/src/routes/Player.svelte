@@ -57,6 +57,7 @@
     metaName={playerState.metaName || playerState.title || ''}
     metaPoster={playerState.metaPoster || ''}
     type={playerState.type}
+    metaId={playerState.metaId || ''}
     videoId={playerState.videoId}
     resumePos={playerState.resumePos}
     subtitleTracks={playerState.subtitleTracks || []}

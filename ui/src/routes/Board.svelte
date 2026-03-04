@@ -14,6 +14,7 @@
   let boardError = '';
 
   onMount(async () => {
+    let syncedItems = [];
     try {
       if ($authKey && $catalogRows.length === 0) {
         await loadAddons($authKey);
@@ -25,7 +26,7 @@
     try {
       if ($authKey) {
         const synced = await getRecentlyPlayed($authKey, 24);
-        continueItems = (synced.items || []).map(item => ({
+        syncedItems = (synced.items || []).map(item => ({
           ...item,
           _progress: item?.state?.duration > 0
             ? Math.round(((item.state.timeOffset || 0) / item.state.duration) * 100)
@@ -33,18 +34,33 @@
         }));
       }
     } catch (_) {
-      continueItems = [];
+      syncedItems = [];
     }
 
-    if (continueItems.length === 0) {
-      const raw = getContinueItems();
-      continueItems = raw.map(item => ({
-        ...item,
-        id: item.videoId,
-        name: item.name || item.videoId,
-        _progress: item.duration > 0 ? Math.round((item.position / item.duration) * 100) : 0,
-      }));
+    const localItems = getContinueItems().map(item => ({
+      ...item,
+      id: item.videoId,
+      name: item.name || item.videoId,
+      _progress: item.duration > 0 ? Math.round((item.position / item.duration) * 100) : 0,
+      updatedAt: item.updatedAt || 0,
+    }));
+
+    const merged = new Map();
+    for (const item of [...syncedItems, ...localItems]) {
+      const key = `${item.type || 'movie'}:${item.id || item.videoId || item.name}`;
+      const prev = merged.get(key);
+      const itemTime = new Date(item?.state?.lastWatched || item?.updatedAt || 0).getTime();
+      const prevTime = prev
+        ? new Date(prev?.state?.lastWatched || prev?.updatedAt || 0).getTime()
+        : -1;
+      if (!prev || itemTime >= prevTime) merged.set(key, item);
     }
+
+    continueItems = [...merged.values()].sort((a, b) => {
+      const at = new Date(a?.state?.lastWatched || a?.updatedAt || 0).getTime();
+      const bt = new Date(b?.state?.lastWatched || b?.updatedAt || 0).getTime();
+      return bt - at;
+    }).slice(0, 24);
 
     loadingContinue = false;
   });

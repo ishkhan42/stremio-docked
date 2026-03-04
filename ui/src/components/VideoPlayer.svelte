@@ -70,6 +70,7 @@
   export let subtitleTracks = [];        // [{ lang, label, url }] from addons
   export let title          = '';
   export let type           = 'movie';
+  export let metaId         = '';
   export let videoId        = '';
   export let resumePos      = 0;
   export let hasNext        = false;
@@ -108,6 +109,7 @@
   let prefetchStats = null;
   let prefetchPollTimer;
   let backgroundDownloadBusy = false;
+  let backgroundDownloadQueued = false;
   let lastSyncedAt = 0;
   let lastSyncedPos = 0;
 
@@ -176,6 +178,11 @@
   $: prefetchSummary = prefetchStats
     ? `${formatBytes(prefetchStats.bytesDownloaded)}${prefetchStats.totalBytes > 0 ? ` / ${formatBytes(prefetchStats.totalBytes)}` : ''}`
     : '';
+  $: downloadBtnLabel = backgroundDownloadBusy
+    ? 'Starting…'
+    : backgroundDownloadQueued
+      ? 'Queued'
+      : 'Download';
   $: statusTitle = `Mode: ${playbackMode}\nState: ${playbackState}\nBuffered ahead: ${Math.round(bufferedAhead)}s\nAudio tracks: ${audioTracks.length}`;
 
   /** Grouped subtitle sections: embedded HLS + addon, grouped by language */
@@ -299,6 +306,8 @@
     timelineBaseDuration = 0;
     audioTracks       = [];
     hlsSubtitleTracks = [];
+    backgroundDownloadBusy = false;
+    backgroundDownloadQueued = false;
     clearInterval(saveTimer);
     clearInterval(stallWatchTimer);
     stopPrefetch();
@@ -792,9 +801,13 @@
 
   async function triggerBackgroundDownload() {
     if (!infoHash || backgroundDownloadBusy) return;
+    if (backgroundDownloadQueued) {
+      showStatusHint('Background download already queued for this stream.');
+      return;
+    }
     backgroundDownloadBusy = true;
     try {
-      await startBackgroundDownload({
+      const result = await startBackgroundDownload({
         infoHash,
         fileIdx,
         startTimeSec: currentTime || 0,
@@ -805,7 +818,9 @@
         metaName,
         metaPoster,
       });
-      showStatusHint('Background download started. Track progress in Downloads.');
+      backgroundDownloadQueued = true;
+      const id = result?.downloadId || `${String(infoHash).toLowerCase()}:${Number(fileIdx || 0)}`;
+      showStatusHint(`Background download queued (${id}). Open Downloads to track.`);
     } catch (err) {
       showStatusHint(`Background download failed: ${err.message}`);
     } finally {
@@ -825,17 +840,17 @@
       await syncRecentlyPlayed({
         authKey: $authKey,
         type,
-        mediaId: videoId,
+        mediaId: metaId || videoId,
         videoId,
-        name: metaName || title || videoId,
+        name: metaName || title || metaId || videoId,
         poster: metaPoster || '',
         position: currentTime || 0,
         duration: duration || 0,
       });
       lastSyncedAt = now;
       lastSyncedPos = currentTime || 0;
-    } catch {
-      // best-effort sync
+    } catch (err) {
+      console.warn('[player] recent sync failed:', err?.message || err);
     }
   }
 
@@ -1458,11 +1473,12 @@
           {#if infoHash}
             <button
               class="icon-btn next-btn"
+              class:active={backgroundDownloadQueued}
               data-focusable="true"
               on:click|stopPropagation={triggerBackgroundDownload}
-              disabled={backgroundDownloadBusy}
+              disabled={backgroundDownloadBusy || backgroundDownloadQueued}
             >
-              {backgroundDownloadBusy ? 'Starting…' : 'Download'}
+              {downloadBtnLabel}
             </button>
           {/if}
           {#if hasNext}

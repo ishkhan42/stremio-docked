@@ -159,6 +159,7 @@
       metaName:       meta?.name || '',
       metaPoster:     meta?.poster || '',
       type,
+      metaId:         id,
       videoId:        vidId,
       resumePos:      prog?.position || 0,
       subtitleTracks: subtitles.map(s => ({

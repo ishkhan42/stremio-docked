@@ -34,7 +34,7 @@
   async function load() {
     try {
       const res = await getDownloads();
-      items = res.items || [];
+      items = (res.items || []).map(normalizeItem);
       error = '';
     } catch (err) {
       error = err.message;
@@ -68,8 +68,29 @@
     return `${hash.slice(0, 8)}…${hash.slice(-6)}`;
   }
 
+  function normalizeItem(item) {
+    const id = String(item?.id || '');
+    const match = id.match(/^([a-f0-9]{40}):(\d+)$/i);
+    const inferredHash = match?.[1]?.toLowerCase() || '';
+    const inferredFileIdx = match ? Number(match[2]) : 0;
+
+    const infoHash = String(item?.infoHash || inferredHash || '').toLowerCase();
+    const fileIdx = Number.isFinite(Number(item?.fileIdx)) ? Number(item.fileIdx) : inferredFileIdx;
+    const name = item?.metaName || item?.title || item?.videoId || (infoHash ? `Downloaded ${shortHash(infoHash)}` : 'Downloaded stream');
+    const kind = item?.type || (String(item?.videoId || '').includes(':') ? 'series' : 'movie');
+
+    return {
+      ...item,
+      infoHash,
+      fileIdx,
+      type: kind,
+      displayName: name,
+      displayVideoId: item?.videoId || `${kind}:${shortHash(infoHash)}:${fileIdx}`,
+    };
+  }
+
   function isPlayable(item) {
-    return !!item?.infoHash && Number.isInteger(Number(item?.fileIdx));
+    return /^[a-f0-9]{40}$/i.test(String(item?.infoHash || '')) && Number(item?.fileIdx) >= 0;
   }
 
   function playItem(item) {
@@ -83,8 +104,8 @@
       infoHash,
       fileIdx,
       streamType: 'torrent',
-      title: item.title || item.metaName || item.videoId || 'Downloaded stream',
-      metaName: item.metaName || item.title || '',
+      title: item.displayName || item.title || item.metaName || item.videoId || 'Downloaded stream',
+      metaName: item.metaName || item.displayName || item.title || '',
       metaPoster: item.metaPoster || '',
       type: item.type || 'movie',
       videoId: item.videoId || `${item.type || 'movie'}:${infoHash}:${fileIdx}`,
@@ -134,7 +155,7 @@
             <div class="top">
               <div class="poster-wrap">
                 {#if item.metaPoster}
-                  <img class="poster" src={imageProxyUrl(item.metaPoster)} alt={item.metaName || item.title || 'Poster'} />
+                  <img class="poster" src={imageProxyUrl(item.metaPoster)} alt={item.displayName || 'Poster'} />
                 {:else}
                   <div class="poster-fallback">No
                     <span>Poster</span>
@@ -143,9 +164,9 @@
               </div>
 
               <div>
-                <h2 class="name">{item.metaName || item.title || item.videoId || item.id}</h2>
+                <h2 class="name">{item.displayName}</h2>
                 <p class="meta">{item.type || 'video'} · {item.status || 'unknown'} · File {item.fileIdx ?? 0}</p>
-                <p class="meta small">{item.videoId || 'Unknown ID'}</p>
+                <p class="meta small">{item.displayVideoId}</p>
                 <p class="meta small">Hash {shortHash(item.infoHash)}</p>
                 <p class="meta small">Updated {formatDate(item.updatedAt)}</p>
               </div>
