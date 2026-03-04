@@ -4,11 +4,15 @@
   import { getDownloads, deleteDownload } from '../lib/api.js';
   import { imageProxyUrl } from '../lib/api.js';
   import { savePlayerState } from '../lib/storage.js';
+  import { fetchMeta, fetchSubtitles } from '../lib/addons.js';
+  import { metaAddons, subtitleAddons, loadAddons } from '../stores/addons.js';
+  import { authKey } from '../stores/auth.js';
 
   let items = [];
   let loading = true;
   let error = '';
   let refreshTimer;
+  let addonsReady = false;
 
   function formatBytes(bytes) {
     const value = Number(bytes || 0);
@@ -33,8 +37,10 @@
 
   async function load() {
     try {
+      await ensureAddonsReady();
       const res = await getDownloads();
       items = (res.items || []).map(normalizeItem);
+      await hydrateMissingMeta(items);
       error = '';
     } catch (err) {
       error = err.message;
@@ -74,29 +80,111 @@
     const inferredHash = match?.[1]?.toLowerCase() || '';
     const inferredFileIdx = match ? Number(match[2]) : 0;
 
+    const rawVideoId = String(item?.videoId || '');
+    const videoParts = rawVideoId.split(':');
+    const looksEpisodeId = videoParts.length >= 3 && /\d+/.test(videoParts.at(-1) || '') && /\d+/.test(videoParts.at(-2) || '');
+
     const infoHash = String(item?.infoHash || inferredHash || '').toLowerCase();
     const fileIdx = Number.isFinite(Number(item?.fileIdx)) ? Number(item.fileIdx) : inferredFileIdx;
     const name = item?.metaName || item?.title || item?.videoId || (infoHash ? `Downloaded ${shortHash(infoHash)}` : 'Downloaded stream');
-    const kind = item?.type || (String(item?.videoId || '').includes(':') ? 'series' : 'movie');
+    const kind = item?.type || (looksEpisodeId ? 'series' : 'movie');
+    const metaId = String(
+      item?.metaId ||
+      (looksEpisodeId ? videoParts[0] : rawVideoId) ||
+      ''
+    );
 
     return {
       ...item,
       infoHash,
       fileIdx,
       type: kind,
+      metaId,
       displayName: name,
       displayVideoId: item?.videoId || `${kind}:${shortHash(infoHash)}:${fileIdx}`,
     };
+  }
+
+  async function hydrateMissingMeta(list) {
+    const needs = list.filter(item => item.metaId && (!item.metaPoster || !item.metaName || !item.title));
+    if (!needs.length) return;
+
+    await ensureAddonsReady();
+
+    for (const item of needs) {
+      const addons = metaAddons(item.type || 'movie', item.metaId || '');
+      if (!addons.length) continue;
+      for (const addon of addons) {
+        try {
+          const result = await fetchMeta(addon, item.type || 'movie', item.metaId);
+          const meta = result?.meta || result;
+          if (!meta) continue;
+
+          item.metaName = item.metaName || meta.name || '';
+          item.title = item.title || meta.name || '';
+          item.metaPoster = item.metaPoster || meta.poster || '';
+          item.displayName = item.metaName || item.title || item.displayName;
+          break;
+        } catch {
+          // try next addon
+        }
+      }
+
+      if (!item.metaName || !item.metaPoster) {
+        const fallback = await fetchCinemetaMeta(item.type || 'movie', item.metaId);
+        if (fallback) {
+          item.metaName = item.metaName || fallback.name || '';
+          item.title = item.title || fallback.name || '';
+          item.metaPoster = item.metaPoster || fallback.poster || '';
+          item.displayName = item.metaName || item.title || item.displayName;
+        }
+      }
+    }
+
+    items = [...list];
+  }
+
+  async function fetchCinemetaMeta(kind, mediaId) {
+    try {
+      const url = `https://v3-cinemeta.strem.io/meta/${kind}/${mediaId}.json`;
+      const res = await fetch(`/api/addon-proxy?url=${encodeURIComponent(url)}`);
+      if (!res.ok) return null;
+      const payload = await res.json();
+      return payload?.meta || null;
+    } catch {
+      return null;
+    }
   }
 
   function isPlayable(item) {
     return /^[a-f0-9]{40}$/i.test(String(item?.infoHash || '')) && Number(item?.fileIdx) >= 0;
   }
 
-  function playItem(item) {
+  async function playItem(item) {
     if (!isPlayable(item)) return;
     const infoHash = String(item.infoHash || '').toLowerCase();
     const fileIdx = Number(item.fileIdx || 0);
+
+    let subtitles = [];
+    const idCandidates = [item.videoId, item.metaId].filter(Boolean);
+    if (idCandidates.length) {
+      await ensureAddonsReady();
+      for (const candidateId of idCandidates) {
+        const sAddons = subtitleAddons(item.type || 'movie', candidateId);
+        if (!sAddons.length) continue;
+        const all = await Promise.allSettled(sAddons.map(a => fetchSubtitles(a, item.type || 'movie', candidateId, {})));
+        subtitles = all
+          .filter(r => r.status === 'fulfilled' && Array.isArray(r.value?.subtitles))
+          .flatMap(r => r.value.subtitles || [])
+          .map(s => ({
+            lang: s.lang || s.id || 'und',
+            label: s.lang || s.id || 'Unknown',
+            url: s.url,
+          }));
+        if (subtitles.length) break;
+      }
+    }
+
     const state = {
       streamUrl: `/ss/${infoHash}/${fileIdx}`,
       directUrl: `/ss/${infoHash}/${fileIdx}`,
@@ -108,9 +196,10 @@
       metaName: item.metaName || item.displayName || item.title || '',
       metaPoster: item.metaPoster || '',
       type: item.type || 'movie',
+      metaId: item.metaId || '',
       videoId: item.videoId || `${item.type || 'movie'}:${infoHash}:${fileIdx}`,
       resumePos: 0,
-      subtitleTracks: [],
+      subtitleTracks: subtitles,
       hasNext: false,
       nextEpisodeId: null,
     };
@@ -121,6 +210,13 @@
   }
 
   $: hasActive = items.some(i => i.status === 'starting' || i.status === 'running');
+
+  async function ensureAddonsReady() {
+    if (addonsReady) return;
+    if (!$authKey) return;
+    await loadAddons($authKey).catch(() => {});
+    addonsReady = true;
+  }
 
   onMount(async () => {
     await load();

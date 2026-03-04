@@ -1,6 +1,8 @@
 <script>
+  import { onMount } from 'svelte';
   import { push, pop } from 'svelte-spa-router';
-  import { metaAddons, streamAddons, subtitleAddons } from '../stores/addons.js';
+  import { addons, metaAddons, streamAddons, subtitleAddons, loadAddons } from '../stores/addons.js';
+  import { authKey } from '../stores/auth.js';
   import { getProgress }  from '../stores/progress.js';
 
   import {
@@ -53,12 +55,18 @@
   // Use reactive statement only — avoids double-fetch from onMount + $:
   let lastFetchedKey = '';
   $: {
-    const key = `${params.type}/${params.id}`;
+    const key = `${params.type}/${params.id}/${$authKey || ''}/${$addons.length}`;
     if (params.type && params.id && key !== lastFetchedKey) {
       lastFetchedKey = key;
       fetchMetaData();
     }
   }
+
+  onMount(async () => {
+    if ($authKey && $addons.length === 0) {
+      await loadAddons($authKey).catch(() => {});
+    }
+  });
 
   async function fetchMetaData() {
     loading   = true;
@@ -66,7 +74,11 @@
     meta      = null;
 
     try {
-      const mAddons = metaAddons(type, id);
+      let mAddons = metaAddons(type, id);
+      if (mAddons.length === 0 && $authKey) {
+        await loadAddons($authKey);
+        mAddons = metaAddons(type, id);
+      }
 
       // Try each meta addon until we get a result
       for (const addon of mAddons) {
@@ -77,11 +89,28 @@
         } catch (_) {}
       }
 
+      if (!meta) {
+        const fallback = await fetchCinemetaMeta(type, id);
+        if (fallback) meta = fallback;
+      }
+
       if (!meta) throw new Error('This title was not found in any of your add-ons.');
     } catch (e) {
       loadError = e.message;
     } finally {
       loading = false;
+    }
+  }
+
+  async function fetchCinemetaMeta(kind, mediaId) {
+    try {
+      const url = `https://v3-cinemeta.strem.io/meta/${kind}/${mediaId}.json`;
+      const res = await fetch(`/api/addon-proxy?url=${encodeURIComponent(url)}`);
+      if (!res.ok) return null;
+      const payload = await res.json();
+      return payload?.meta || null;
+    } catch {
+      return null;
     }
   }
 

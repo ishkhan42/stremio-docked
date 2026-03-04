@@ -263,6 +263,7 @@ async function startPrefetchJob({ infoHash, fileIdx, startTimeSec = 0, durationS
             fileIdx,
             title: metadata.title || '',
             type: metadata.type || '',
+            metaId: metadata.metaId || '',
             videoId: metadata.videoId || '',
             metaName: metadata.metaName || '',
             metaPoster: metadata.metaPoster || '',
@@ -882,6 +883,7 @@ app.post('/stream-prefetch/start', async (req, res) => {
         const metadata = {
             title: String(req.body?.title || ''),
             type: String(req.body?.type || ''),
+            metaId: String(req.body?.metaId || ''),
             videoId: String(req.body?.videoId || ''),
             metaName: String(req.body?.metaName || ''),
             metaPoster: String(req.body?.metaPoster || ''),

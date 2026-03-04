@@ -814,6 +814,7 @@
         durationSec: duration || 0,
         title,
         type,
+        metaId,
         videoId,
         metaName,
         metaPoster,
