@@ -147,8 +147,11 @@
 
     // Navigate to player with history state
     const playerState = {
-      streamUrl:      resolved.hlsUrl || resolved.url || '',
+      streamUrl:      resolved.url    || '',
       directUrl:      resolved.url    || '',
+      hlsUrl:         resolved.hlsUrl || '',
+      infoHash:       resolved.infoHash || '',
+      fileIdx:        resolved.fileIdx ?? 0,
       streamType:     resolved.type   || 'http',
       title:          selectedEpisode
         ? `${meta?.name} – S${selectedEpisode.season}E${selectedEpisode.episode || selectedEpisode.number || '?'} ${selectedEpisode.title || selectedEpisode.name || ''}`

@@ -82,6 +82,32 @@ export function imageProxyUrl(originalUrl) {
     return `/api/image-proxy?url=${encodeURIComponent(originalUrl)}`;
 }
 
+/**
+ * Get media track info via ffprobe (audio, subtitle, video tracks).
+ * @param {string} infoHash
+ * @param {number} fileIdx
+ * @returns {Promise<{audio: Array, subtitles: Array, video: Array}>}
+ */
+export async function getMediaInfo(infoHash, fileIdx = 0) {
+    return call(`/media-info?infoHash=${encodeURIComponent(infoHash)}&fileIdx=${fileIdx}`);
+}
+
+/**
+ * Create a server-side audio-switch playback URL for a selected track.
+ * Uses remux (copy) first, then audio-only transcode fallback on backend.
+ */
+export async function createAudioSwitchUrl({ infoHash, fileIdx = 0, audioTrackIndex, startTimeSec = 0 }) {
+    return call('/audio-switch-url', {
+        method: 'POST',
+        body: JSON.stringify({
+            infoHash,
+            fileIdx,
+            audioTrackIndex,
+            startTimeSec,
+        }),
+    });
+}
+
 /** Check stremio-server status. */
 export async function serverStatus() {
     return call('/server-status');

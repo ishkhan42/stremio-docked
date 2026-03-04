@@ -3,7 +3,7 @@
   import Hls from 'hls.js';
   import { recordProgress } from '../stores/progress.js';
   import { matchKey, KEYS } from '../lib/keyboard.js';
-  import { subtitleProxyUrl } from '../lib/api.js';
+  import { subtitleProxyUrl, getMediaInfo, createAudioSwitchUrl } from '../lib/api.js';
   import { prefs } from '../stores/progress.js';
 
   const dispatch = createEventDispatcher();
@@ -53,6 +53,9 @@
   // ── Props ──────────────────────────────────────────────────────────────────
   export let streamUrl      = '';
   export let directUrl      = '';
+  export let hlsUrl         = '';
+  export let infoHash       = '';
+  export let fileIdx        = 0;
   export let streamType     = 'torrent';
   export let subtitleTracks = [];        // [{ lang, label, url }] from addons
   export let title          = '';
@@ -75,6 +78,16 @@
   let fullscreen = false;
   let errorMsg   = '';
   let hlsFailed  = false;
+  let usingHls   = false;
+  let audioSwitchSession = false;
+  let audioSwitchTranscoding = false;
+  let timelineOffsetSec = 0;
+  let timelineBaseDuration = 0;
+  let bufferedAhead = 0;
+  let pendingAudioSwitch = null;
+  let switchRollbackTimer;
+  let statusHint = '';
+  let statusHintTimer;
 
   // Controls visibility
   let showControls   = true;
@@ -100,11 +113,45 @@
   // Progress save interval
   let saveTimer;
 
+  // ffprobe media info (for track discovery in direct mode)
+  let mediaInfo     = null;  // { audio: [...], subtitles: [...], video: [...] }
+  let mediaInfoErr  = false;
+
+  /** Format codec name for display (e.g., 'aac' → 'AAC', 'truehd' → 'TrueHD') */
+  const CODEC_LABELS = {
+    aac:     'AAC',   ac3:      'AC3 / Dolby Digital',
+    eac3:    'EAC3 / Dolby Digital+', truehd:  'TrueHD / Dolby Atmos',
+    dts:     'DTS',   'dts-hd': 'DTS-HD',
+    flac:    'FLAC',  opus:     'Opus',
+    vorbis:  'Vorbis', pcm_s16le: 'PCM', pcm_s24le: 'PCM 24-bit',
+    mp3:     'MP3',   mp2:      'MP2',
+  };
+  function codecLabel(codec, profile) {
+    if (codec === 'truehd' && profile?.toLowerCase().includes('atmos')) return 'Dolby Atmos / TrueHD';
+    if (codec === 'eac3' && profile?.toLowerCase().includes('atmos'))  return 'Dolby Atmos / EAC3';
+    return CODEC_LABELS[codec] || codec?.toUpperCase() || '';
+  }
+  function channelLabel(ch) {
+    if (ch === 8) return '7.1';
+    if (ch === 6) return '5.1';
+    if (ch === 2) return 'Stereo';
+    if (ch === 1) return 'Mono';
+    return ch ? `${ch}ch` : '';
+  }
+
   // ── Derived ────────────────────────────────────────────────────────────────
   $: progressPct  = duration > 0 ? (currentTime / duration) * 100 : 0;
   $: isSubActive  = activeSubTrack >= 0 || currentHlsSubTrack >= 0;
   $: hasAnySubs   = hlsSubtitleTracks.length > 0 || subtitleTracks.length > 0;
   $: hasAudio     = audioTracks.length > 1;
+  $: playbackMode = audioSwitchSession
+    ? (audioSwitchTranscoding ? 'Audio-Only Transcode' : 'Audio Remux (Video Copy)')
+    : (usingHls ? 'Transcoded (HLS)' : 'Direct');
+  $: playbackSource = audioSwitchSession
+    ? (audioSwitchTranscoding ? 'Server audio transcode + video copy' : 'Server remux (no video transcode)')
+    : (usingHls ? 'Server transcoding' : 'Direct file playback');
+  $: playbackState = errorMsg ? 'Error' : buffering ? 'Buffering' : playing ? 'Playing' : 'Paused';
+  $: statusTitle = `Mode: ${playbackMode}\nState: ${playbackState}\nBuffered ahead: ${Math.round(bufferedAhead)}s\nAudio tracks: ${audioTracks.length}`;
 
   /** Grouped subtitle sections: embedded HLS + addon, grouped by language */
   $: subGroups = buildSubGroups(hlsSubtitleTracks, subtitleTracks, $prefs.subtitleLanguage || 'eng');
@@ -160,6 +207,45 @@
     document.addEventListener('keydown', handleKey, { capture: true });
     document.addEventListener('fullscreenchange', onFullscreenChange);
     setupPlayer();
+
+    // In parallel: fetch track info via ffprobe if it's a torrent stream
+    if (infoHash) {
+      getMediaInfo(infoHash, fileIdx).then(info => {
+        mediaInfo = info;
+        console.log('[player] Media info:', info.audio?.length, 'audio,', info.subtitles?.length, 'subs');
+
+        // Populate audioTracks from ffprobe data (works even when native API doesn't)
+        if (info.audio?.length && audioTracks.length === 0) {
+          audioTracks = info.audio.map((a, i) => ({
+            id:   i,
+            name: a.title || langName(a.language) || `Track ${i + 1}`,
+            lang: a.language || '',
+            codec:    a.codec,
+            profile:  a.profile,
+            channels: a.channels,
+            channelLayout: a.channelLayout,
+            isDefault: a.default,
+            _probed: true,
+          }));
+          // Set current to the default track
+          const defIdx = audioTracks.findIndex(t => t.isDefault);
+          currentAudioTrack = defIdx >= 0 ? defIdx : 0;
+        }
+
+        // Populate embedded subtitle tracks from ffprobe
+        if (info.subtitles?.length && hlsSubtitleTracks.length === 0 && !usingHls) {
+          hlsSubtitleTracks = info.subtitles.map((s, i) => ({
+            id:   i,
+            name: s.title || langName(s.language) || `Subtitle ${i + 1}`,
+            lang: s.language || '',
+            forced: s.forced,
+          }));
+        }
+      }).catch(err => {
+        console.warn('[player] Media info fetch failed:', err.message);
+        mediaInfoErr = true;
+      });
+    }
   });
 
   onDestroy(() => {
@@ -167,30 +253,55 @@
     document.removeEventListener('fullscreenchange', onFullscreenChange);
     cleanupHls();
     clearInterval(saveTimer);
+    clearTimeout(switchRollbackTimer);
     clearTimeout(controlTimer);
     clearTimeout(feedbackTimer);
+    clearTimeout(statusHintTimer);
   });
 
   // ── Player setup ──────────────────────────────────────────────────────────
   function setupPlayer() {
     if (!videoEl) return;
-    const url = normalizePlayableUrl(streamUrl || directUrl);
-    if (!url) return;
 
-    errorMsg     = '';
-    hlsFailed    = false;
-    audioTracks  = [];
-    clearInterval(saveTimer);  // prevent stacking intervals on retry
+    // Prefer direct URL for passthrough (HDR, Dolby Atmos, TrueHD, lossless audio)
+    const direct       = normalizePlayableUrl(streamUrl || directUrl);
+    const hlsFallback  = normalizePlayableUrl(hlsUrl || '');
+    if (!direct && !hlsFallback) return;
 
-    const isHlsUrl  = url.includes('.m3u8') || url.includes('/master') || url.includes('/hlsv2');
-    const useHlsJs  = isHlsUrl && Hls.isSupported();
-    const nativeHls = isHlsUrl && !Hls.isSupported() && videoEl.canPlayType('application/vnd.apple.mpegurl');
+    errorMsg          = '';
+    hlsFailed         = false;
+    usingHls          = false;
+    audioSwitchSession = false;
+    audioSwitchTranscoding = false;
+    timelineOffsetSec = 0;
+    timelineBaseDuration = 0;
+    audioTracks       = [];
+    hlsSubtitleTracks = [];
+    clearInterval(saveTimer);
+    cleanupHls();
 
-    if (useHlsJs) {
-      initHlsJs(url);
-    } else {
-      const src = (!isHlsUrl || nativeHls) ? url : (normalizePlayableUrl(directUrl) || url);
-      videoEl.src = src;
+    const isHlsManifest = direct && /\.m3u8($|\?)/i.test(direct);
+
+    if (isHlsManifest && Hls.isSupported()) {
+      // URL is already an HLS manifest (e.g. external streaming addon) → hls.js
+      usingHls = true;
+      initHlsJs(direct);
+    } else if (isHlsManifest && videoEl.canPlayType('application/vnd.apple.mpegurl')) {
+      // Native HLS (Safari / some Smart TVs)
+      videoEl.src = direct;
+      videoEl.load();
+    } else if (direct) {
+      // ★ Direct playback — preserves HDR, Dolby Atmos, TrueHD, multi-channel audio
+      console.log('[player] Starting direct playback:', direct);
+      videoEl.src = direct;
+      videoEl.load();
+      setupNativeTrackListeners();
+    } else if (hlsFallback && Hls.isSupported()) {
+      // Only HLS URL available
+      usingHls = true;
+      initHlsJs(hlsFallback);
+    } else if (hlsFallback) {
+      videoEl.src = hlsFallback;
       videoEl.load();
     }
 
@@ -204,8 +315,19 @@
     }, 5000);
   }
 
-  function initHlsJs(url) {
+  function initHlsJs(url, options = {}) {
+    const switchingFromDirect = options?.reason === 'audio-switch';
     cleanupHls();
+    usingHls = true;
+    audioSwitchSession = switchingFromDirect;
+    audioSwitchTranscoding = !!options?.transcoding;
+    if (switchingFromDirect) {
+      timelineOffsetSec = Math.max(0, Number(options?.resumeTime) || 0);
+      timelineBaseDuration = Math.max(duration || 0, Number(options?.baseDuration) || 0);
+    } else {
+      timelineOffsetSec = 0;
+      timelineBaseDuration = 0;
+    }
     hls = new Hls({
       enableWorker:         true,
       lowLatencyMode:       false,
@@ -247,7 +369,9 @@
     hls.attachMedia(videoEl);
 
     hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
-      audioTracks       = [...(hls.audioTracks      || [])];
+      if (!switchingFromDirect) {
+        audioTracks = [...(hls.audioTracks || [])];
+      }
       hlsSubtitleTracks = [...(hls.subtitleTracks   || [])];
       // Sync currentAudioTrack to what hls.js defaulted to
       currentAudioTrack = hls.audioTrack;
@@ -255,7 +379,23 @@
         audioTracks.map(t => `id=${t.id} ${t.name}/${t.lang}`));
       console.log('[hls] Subtitle:', hlsSubtitleTracks.length,
         hlsSubtitleTracks.map(t => `id=${t.id} ${t.name}/${t.lang}`));
-      applyPreferredAudio();
+      if (switchingFromDirect && options?.requestedTrackId != null) {
+        currentAudioTrack = options.requestedTrackId;
+      } else if (options?.requestedTrackId != null) {
+        const targetTrackId = mapRequestedTrackToHlsId(options.requestedTrackId, hls.audioTracks || []);
+        if (targetTrackId != null) {
+          hls.audioTrack = targetTrackId;
+          currentAudioTrack = targetTrackId;
+        }
+      } else {
+        applyPreferredAudio();
+      }
+
+      if (options?.resumeTime > 0) {
+        videoEl.currentTime = options.resumeTime;
+      }
+
+      clearTimeout(switchRollbackTimer);
       videoEl.play().catch(() => {});
     });
 
@@ -278,32 +418,128 @@
       console.warn('[hls] Error:', data.type, data.details, data.fatal);
       if (!data.fatal) return;
       console.error('[hls] Fatal error:', data);
-      const fallback = normalizePlayableUrl(directUrl);
+
+      if (switchingFromDirect) {
+        if (options?.onFatal) options.onFatal(data);
+        return;
+      }
+
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-        // Try recovery first, then fallback after delay
+        // Retry — HLS segments may still be generating (stremio-server transcoding)
         hls.startLoad();
         setTimeout(() => {
-          if (!videoEl) return;  // component destroyed
+          if (!videoEl) return;
           if (buffering || !playing) {
-            if (fallback && fallback !== url) {
-              cleanupHls(); videoEl.src = fallback; videoEl.load(); videoEl.play().catch(() => {});
-            } else { errorMsg = 'Network error — stream may still be loading. Try again in a moment.'; }
+            hlsFailed = true;
+            errorMsg = 'Network error — stream may still be loading. Try again in a moment.';
           }
-        }, 5000);
+        }, 8000);
         return;
       } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
         hls.recoverMediaError();
       } else {
         hlsFailed = true;
-        if (fallback && fallback !== url && videoEl) {
-          cleanupHls(); videoEl.src = fallback; videoEl.load(); videoEl.play().catch(() => {});
-        } else { errorMsg = 'Playback error — format may be incompatible with your browser.'; }
+        errorMsg = 'Playback error — format may be incompatible with your browser.';
       }
     });
   }
 
+  function mapRequestedTrackToHlsId(requestedTrackId, hlsTracks) {
+    if (!hlsTracks?.length) return null;
+
+    if (mediaInfo?.audio?.[requestedTrackId]) {
+      const wanted = mediaInfo.audio[requestedTrackId];
+      const wantLang = (wanted.language || '').toLowerCase();
+      if (wantLang) {
+        const langMatch = hlsTracks.find(t => (t.lang || '').toLowerCase() === wantLang);
+        if (langMatch) return langMatch.id;
+      }
+      if (requestedTrackId < hlsTracks.length) return hlsTracks[requestedTrackId].id;
+    }
+
+    if (requestedTrackId < hlsTracks.length) return hlsTracks[requestedTrackId].id;
+    return hlsTracks[0].id;
+  }
+
+  function showStatusHint(msg) {
+    statusHint = msg;
+    clearTimeout(statusHintTimer);
+    statusHintTimer = setTimeout(() => { statusHint = ''; }, 3500);
+  }
+
+  function rollbackToDirectPlayback(resumeTime = 0, hintMsg = '') {
+    const direct = normalizePlayableUrl(streamUrl || directUrl);
+    if (!videoEl || !direct) {
+      buffering = false;
+      if (hintMsg) showStatusHint(hintMsg);
+      return;
+    }
+
+    clearTimeout(switchRollbackTimer);
+    cleanupHls();
+    usingHls = false;
+    audioSwitchSession = false;
+    audioSwitchTranscoding = false;
+    timelineOffsetSec = 0;
+    timelineBaseDuration = 0;
+    hlsFailed = false;
+    buffering = false;
+    pendingAudioSwitch = null;
+
+    videoEl.src = direct;
+    const resumeAt = resumeTime || currentTime || 0;
+    const restore = () => {
+      if (resumeAt > 0) videoEl.currentTime = resumeAt;
+      videoEl.play().catch(() => {});
+      videoEl.removeEventListener('loadedmetadata', restore);
+    };
+    videoEl.addEventListener('loadedmetadata', restore);
+    videoEl.load();
+
+    if (hintMsg) showStatusHint(hintMsg);
+  }
+
   function cleanupHls() {
     if (hls) { hls.stopLoad(); hls.detachMedia(); hls.destroy(); hls = null; }
+  }
+
+  /** Set up listeners for native audio/text tracks (direct playback mode). */
+  function setupNativeTrackListeners() {
+    if (!videoEl) return;
+
+    // Audio tracks (multi-audio MKV/MP4)
+    if (videoEl.audioTracks) {
+      const aTracks = videoEl.audioTracks;
+      const syncAudio = () => {
+        audioTracks = Array.from(aTracks).map((t, i) => ({
+          id: i, name: t.label || t.language || `Track ${i + 1}`,
+          lang: t.language || '', _native: true,
+        }));
+        for (let i = 0; i < aTracks.length; i++) {
+          if (aTracks[i].enabled) { currentAudioTrack = i; break; }
+        }
+      };
+      aTracks.addEventListener('addtrack', syncAudio);
+      aTracks.addEventListener('removetrack', syncAudio);
+      aTracks.addEventListener('change', syncAudio);
+    }
+
+    // Embedded text tracks (subtitles/captions in MKV)
+    if (videoEl.textTracks) {
+      const syncSubs = () => {
+        const native = Array.from(videoEl.textTracks).filter(
+          t => (t.kind === 'subtitles' || t.kind === 'captions')
+        );
+        if (native.length && !usingHls) {
+          hlsSubtitleTracks = native.map((t, i) => ({
+            id: i, name: t.label || t.language || `Subtitle ${i + 1}`,
+            lang: t.language || '',
+          }));
+        }
+      };
+      videoEl.textTracks.addEventListener('addtrack', syncSubs);
+      videoEl.textTracks.addEventListener('removetrack', syncSubs);
+    }
   }
 
   function applyPreferredAudio() {
@@ -323,29 +559,64 @@
   }
 
   // ── Video events ──────────────────────────────────────────────────────────
-  function onPlay()    { playing = true;  buffering = false; }
+  function onPlay()    { playing = true;  buffering = false; clearTimeout(switchRollbackTimer); }
   function onPause()   { playing = false; }
   function onWaiting() { buffering = true; }
-  function onPlaying() { buffering = false; playing = true; }
+  function onPlaying() { buffering = false; playing = true; clearTimeout(switchRollbackTimer); }
 
   function onLoadedMeta() {
-    duration = videoEl.duration || 0;
-    if (resumePos > 10 && resumePos < duration - 30) {
+    const mediaDuration = videoEl.duration || 0;
+    if (audioSwitchSession) {
+      const projectedDuration = mediaDuration > 0
+        ? mediaDuration + timelineOffsetSec
+        : 0;
+      duration = Math.max(duration || 0, timelineBaseDuration || 0, projectedDuration);
+    } else {
+      duration = mediaDuration;
+      timelineBaseDuration = duration || timelineBaseDuration;
+    }
+
+    if (!audioSwitchSession && resumePos > 10 && resumePos < duration - 30) {
       videoEl.currentTime = resumePos;
     }
     // Populate native audio tracks for direct video files (non-HLS)
-    if (!hls && videoEl.audioTracks && videoEl.audioTracks.length > 1) {
+    if (!usingHls && videoEl.audioTracks && videoEl.audioTracks.length > 0) {
       audioTracks = Array.from(videoEl.audioTracks).map((t, i) => ({
         id:      i,
         name:    t.label || t.language || `Track ${i + 1}`,
         lang:    t.language || '',
         _native: true,
       }));
+      for (let i = 0; i < videoEl.audioTracks.length; i++) {
+        if (videoEl.audioTracks[i].enabled) { currentAudioTrack = i; break; }
+      }
     }
     videoEl.play().catch(() => {});
   }
 
-  function onTimeUpdate()  { currentTime = videoEl.currentTime; }
+  function onTimeUpdate() {
+    const mediaTime = videoEl.currentTime || 0;
+    currentTime = audioSwitchSession ? (timelineOffsetSec + mediaTime) : mediaTime;
+    updateBufferedAhead();
+  }
+
+  function updateBufferedAhead() {
+    if (!videoEl || !videoEl.buffered || !videoEl.buffered.length) {
+      bufferedAhead = 0;
+      return;
+    }
+    const now = videoEl.currentTime || 0;
+    let ahead = 0;
+    for (let i = 0; i < videoEl.buffered.length; i++) {
+      const start = videoEl.buffered.start(i);
+      const end = videoEl.buffered.end(i);
+      if (now >= start && now <= end) {
+        ahead = end - now;
+        break;
+      }
+    }
+    bufferedAhead = Math.max(0, ahead);
+  }
 
   function onEnded() {
     recordProgress(type, videoId, duration, duration, { name: metaName, poster: metaPoster });
@@ -354,12 +625,23 @@
 
   function onError() {
     if (!videoEl) return;
-    const fallback = normalizePlayableUrl(directUrl);
-    if (!hlsFailed && fallback && videoEl.src !== fallback) {
-      cleanupHls();
-      videoEl.src = fallback; videoEl.load(); videoEl.play().catch(() => {});
+
+    if (usingHls && audioSwitchSession) {
+      rollbackToDirectPlayback(currentTime, 'Selected audio track playback failed. Returned to direct mode.');
       return;
     }
+
+    // If direct playback failed, try HLS transcoding as fallback
+    if (!usingHls && !hlsFailed) {
+      const hlsFallback = normalizePlayableUrl(hlsUrl || '');
+      if (hlsFallback && Hls.isSupported()) {
+        console.log('[player] Direct playback failed, trying HLS transcoding fallback...');
+        usingHls = true;
+        initHlsJs(hlsFallback);
+        return;
+      }
+    }
+
     errorMsg = 'Cannot play this stream. Format may be unsupported by your browser.';
   }
 
@@ -404,7 +686,17 @@
 
   function seek(t) {
     if (!videoEl || !duration) return;
-    videoEl.currentTime = Math.max(0, Math.min(duration, t));
+    const clampedTarget = Math.max(0, Math.min(duration, t));
+    if (audioSwitchSession) {
+      const sessionTarget = Math.max(0, clampedTarget - timelineOffsetSec);
+      if (Number.isFinite(videoEl.duration) && videoEl.duration > 0) {
+        videoEl.currentTime = Math.min(videoEl.duration, sessionTarget);
+      } else {
+        videoEl.currentTime = sessionTarget;
+      }
+    } else {
+      videoEl.currentTime = clampedTarget;
+    }
   }
 
   function seekRelative(delta) {
@@ -438,19 +730,85 @@
   }
 
   // ── Track selection ───────────────────────────────────────────────────────
-  function setAudioTrack(trackId) {
-    if (hls) {
+  async function setAudioTrack(trackId) {
+    if (usingHls && hls && !audioSwitchSession) {
+      // Already in HLS mode — just switch track
       hls.audioTrack    = trackId;
       currentAudioTrack = trackId;
-      console.log('[player] Switching audio to track id:', trackId);
-    } else if (videoEl?.audioTracks) {
-      // Native <video> audio tracks — id is the array index
+      console.log('[player] Switching HLS audio to track id:', trackId);
+    } else if (videoEl?.audioTracks && videoEl.audioTracks.length > 1) {
+      // Native audioTracks API available (rare on Smart TVs, works on desktop)
       for (let i = 0; i < videoEl.audioTracks.length; i++) {
         videoEl.audioTracks[i].enabled = (i === trackId);
       }
       currentAudioTrack = trackId;
+      console.log('[player] Switching native audio to track:', trackId);
+    } else {
+      // Native API unavailable — create dedicated remux session for selected audio
+      const savedTime = currentTime;
+      pendingAudioSwitch = { trackId, resumeTime: savedTime };
+      clearTimeout(switchRollbackTimer);
+      errorMsg = '';
+      buffering = true;
+
+      switchRollbackTimer = setTimeout(() => {
+        rollbackToDirectPlayback(savedTime, 'Audio switch timed out. Stayed on direct playback.');
+      }, 12000);
+
+      if (infoHash) {
+        try {
+          const switched = await createAudioSwitchUrl({
+            infoHash,
+            fileIdx,
+            audioTrackIndex: trackId,
+            startTimeSec: savedTime,
+          });
+          const switchUrl = normalizePlayableUrl(switched.url || '');
+          if (!switchUrl) throw new Error('No switch URL returned');
+
+          initHlsJs(switchUrl, {
+            reason: 'audio-switch',
+            requestedTrackId: trackId,
+            resumeTime: savedTime,
+            baseDuration: duration,
+            transcoding: !!switched.transcoding,
+            onFatal: () => {
+              rollbackToDirectPlayback(savedTime, 'Audio switch stream failed. Returned to direct mode.');
+            },
+          });
+
+          if (switched.transcoding) {
+            showStatusHint('Audio-only transcode active for selected track. Video remains direct quality.');
+          } else {
+            showStatusHint('Audio switched via remux (no video transcoding).');
+          }
+          resetControlTimer();
+          return;
+        } catch (err) {
+          console.warn('[player] audio-switch remux failed:', err.message);
+        }
+      }
+
+      // Last resort for non-torrent streams: fallback to generic HLS URL
+      const hlsFallback = normalizePlayableUrl(hlsUrl || '');
+      if (hlsFallback && Hls.isSupported()) {
+        console.log('[player] Switching to HLS mode for audio track:', trackId, 'at', savedTime);
+
+        initHlsJs(hlsFallback, {
+          reason: 'audio-switch',
+          requestedTrackId: trackId,
+          resumeTime: savedTime,
+          baseDuration: duration,
+          transcoding: true,
+          onFatal: () => {
+            rollbackToDirectPlayback(savedTime, 'Audio track switch failed on transcoder. Stayed on direct mode.');
+          },
+        });
+      } else {
+        console.warn('[player] Cannot switch audio: no HLS fallback available');
+        rollbackToDirectPlayback(savedTime, 'Audio switch not available for this stream on this device.');
+      }
     }
-    // Keep panel open so user sees the selection change
     resetControlTimer();
   }
 
@@ -460,12 +818,25 @@
 
     if (track.source === 'none') {
       activeSubTrack = -1; currentHlsSubTrack = -1;
-      if (hls) hls.subtitleTrack = -1;
+      if (usingHls && hls) hls.subtitleTrack = -1;
+      // Disable all native text tracks
+      if (videoEl.textTracks) {
+        Array.from(videoEl.textTracks).forEach(t => { t.mode = 'disabled'; });
+      }
     } else if (track.source === 'hls') {
-      if (hls) { hls.subtitleTrack = track.hlsIdx; currentHlsSubTrack = track.hlsIdx; }
+      if (usingHls && hls) {
+        hls.subtitleTrack = track.hlsIdx;
+      } else if (videoEl.textTracks) {
+        // Direct mode: use native textTracks API
+        const subs = Array.from(videoEl.textTracks).filter(
+          t => t.kind === 'subtitles' || t.kind === 'captions'
+        );
+        subs.forEach((t, i) => { t.mode = i === track.hlsIdx ? 'showing' : 'disabled'; });
+      }
+      currentHlsSubTrack = track.hlsIdx;
       activeSubTrack = -1;
     } else if (track.source === 'external' && track.url) {
-      if (hls) hls.subtitleTrack = -1;
+      if (usingHls && hls) hls.subtitleTrack = -1;
       currentHlsSubTrack = -1;
       const t   = document.createElement('track');
       t.kind    = 'subtitles'; t.label = track.label;
@@ -545,6 +916,7 @@
     on:playing={onPlaying}
     on:loadedmetadata={onLoadedMeta}
     on:timeupdate={onTimeUpdate}
+    on:progress={updateBufferedAhead}
     on:ended={onEnded}
     on:error={onError}
   ></video>
@@ -635,6 +1007,19 @@
             </svg>
           </button>
         {/if}
+
+        <div class="status-wrap" title={statusTitle}>
+          <span class="status-pill" tabindex="0" data-focusable="true">
+            {usingHls ? 'Transcoded' : 'Direct'} · {buffering ? 'Buffering' : playing ? 'Playing' : 'Paused'}
+          </span>
+          <div class="status-tip" role="note" aria-live="polite">
+            <p><b>Mode:</b> {playbackMode}</p>
+            <p><b>State:</b> {playbackState}</p>
+            <p><b>Buffered:</b> {Math.round(bufferedAhead)}s ahead</p>
+            <p><b>Source:</b> {playbackSource}</p>
+            {#if statusHint}<p><b>Note:</b> {statusHint}</p>{/if}
+          </div>
+        </div>
 
         <button
           class="icon-btn" data-focusable="true"
@@ -818,7 +1203,14 @@
                   </svg>
                 {/if}
               </span>
-              <span class="pi-lbl">{langName(track.lang) || track.name || `Track ${track.id + 1}`}</span>
+              <div class="pi-info">
+                <span class="pi-lbl">{langName(track.lang) || track.name || `Track ${track.id + 1}`}</span>
+                {#if track._probed && (track.codec || track.channels)}
+                  <span class="pi-meta">
+                    {codecLabel(track.codec, track.profile)}{track.channels ? ` · ${channelLabel(track.channels)}` : ''}
+                  </span>
+                {/if}
+              </div>
               {#if track.lang}<span class="pi-tag">{track.lang.toUpperCase()}</span>{/if}
             </button>
           {/each}
@@ -993,6 +1385,54 @@
   }
 
   .top-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+
+  .status-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 7px 12px;
+    border-radius: 999px;
+    font-size: 0.74rem;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    color: rgba(255,255,255,0.9);
+    background: rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,0.18);
+    white-space: nowrap;
+  }
+  .status-pill:focus-visible {
+    outline: 2px solid rgba(139,92,246,0.75);
+    outline-offset: 2px;
+  }
+  .status-tip {
+    position: absolute;
+    top: calc(100% + 10px);
+    right: 0;
+    min-width: 240px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: rgba(9, 9, 18, 0.95);
+    border: 1px solid rgba(255,255,255,0.12);
+    color: rgba(255,255,255,0.85);
+    font-size: 0.78rem;
+    line-height: 1.45;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-4px);
+    transition: opacity 0.14s ease, transform 0.14s ease;
+    z-index: 80;
+  }
+  .status-tip p { margin: 0 0 4px; }
+  .status-tip p:last-child { margin-bottom: 0; }
+  .status-wrap:hover .status-tip,
+  .status-wrap:focus-within .status-tip {
+    opacity: 1;
+    transform: translateY(0);
+  }
 
   /* ── Bottom bar ──────────────────────────────────────────────────────────── */
   .bottom-bar {
@@ -1200,6 +1640,12 @@
     flex-shrink: 0; color: var(--accent-light, #8b5cf6);
   }
   .pi-lbl { flex: 1; }
+  .pi-info { display: flex; flex-direction: column; flex: 1; gap: 2px; }
+  .pi-info .pi-lbl { flex: none; }
+  .pi-meta {
+    font-size: 0.72rem; color: rgba(255,255,255,0.35);
+    font-weight: 500; letter-spacing: 0.2px;
+  }
   .pi-tag {
     font-size: 0.68rem; font-weight: 700; letter-spacing: 0.4px;
     background: rgba(255,255,255,0.07); color: rgba(255,255,255,0.38);
@@ -1229,6 +1675,8 @@
 
     .vol-slider      { width: 130px; }
     .top-title       { font-size: 1.15rem; }
+    .status-pill     { font-size: 0.82rem; padding: 8px 14px; }
+    .status-tip      { min-width: 270px; font-size: 0.84rem; }
     .back-pill       { font-size: 1rem; padding: 10px 20px 10px 14px; }
     .back-pill svg   { width: 20px; height: 20px; }
     .next-btn        { font-size: 0.95rem; padding: 11px 22px; }

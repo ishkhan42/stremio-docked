@@ -49,6 +49,9 @@
   <VideoPlayer
     streamUrl={playerState.streamUrl}
     directUrl={playerState.directUrl}
+    hlsUrl={playerState.hlsUrl || ''}
+    infoHash={playerState.infoHash || ''}
+    fileIdx={playerState.fileIdx ?? 0}
     streamType={playerState.streamType}
     title={playerState.title}
     metaName={playerState.metaName || playerState.title || ''}
