@@ -14,7 +14,8 @@
 
   import NavBar from './components/NavBar.svelte';
 
-  import { isLoggedIn } from './stores/auth.js';
+  import { isLoggedIn, authKey } from './stores/auth.js';
+  import { addons, addonsLoading, loadAddons } from './stores/addons.js';
   import { initNav }    from './lib/keyboard.js';
 
   const routes = {
@@ -29,6 +30,7 @@
   };
 
   let showNav = true;
+  let addonBootstrapKey = '';
 
   // Hide nav bar while in fullscreen player
   $: showNav = true; // player hides it via CSS
@@ -38,6 +40,16 @@
     // Redirect to login if not authenticated
     if (!$isLoggedIn) push('/login');
   });
+
+  $: if ($isLoggedIn && $authKey) {
+    const key = `${$authKey}:${$addons.length}`;
+    if (key !== addonBootstrapKey && !$addonsLoading) {
+      addonBootstrapKey = key;
+      if ($addons.length === 0) {
+        loadAddons($authKey).catch(() => {});
+      }
+    }
+  }
 
   // Extend routes conditionally
   $: if (!$isLoggedIn) {

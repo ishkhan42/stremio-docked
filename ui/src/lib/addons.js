@@ -17,6 +17,13 @@ function baseUrl(addon) {
     return addon.transportUrl.replace('/manifest.json', '');
 }
 
+function resolveManifest(addon) {
+    if (!addon) return null;
+    if (addon.manifest) return addon.manifest;
+    if (addon.resources || addon.types || addon.catalogs || addon.id) return addon;
+    return null;
+}
+
 /**
  * Fetch the manifest for an add-on URL.
  */
@@ -118,7 +125,7 @@ export async function fetchSubtitles(addon, type, videoId, extra = {}) {
 export function getAddonCatalogs(addons) {
     const rows = [];
     for (const addon of addons) {
-        const manifest = addon.manifest;
+        const manifest = resolveManifest(addon);
         if (!manifest?.catalogs?.length) continue;
         // Check if addon has catalog resource
         const hasCatalog = !manifest.resources ||
@@ -151,7 +158,7 @@ export function getAddonCatalogs(addons) {
  */
 export function getStreamAddons(addons, type, id) {
     return addons.filter(addon => {
-        const manifest = addon.manifest;
+        const manifest = resolveManifest(addon);
         if (!manifest) return false;
 
         const hasStream = !manifest.resources ||
@@ -174,7 +181,7 @@ export function getStreamAddons(addons, type, id) {
  */
 export function getSubtitleAddons(addons, type, id) {
     return addons.filter(addon => {
-        const manifest = addon.manifest;
+        const manifest = resolveManifest(addon);
         if (!manifest) return false;
         const hasSubs = manifest.resources?.includes('subtitles') ||
             manifest.resources?.some?.(r => r === 'subtitles' || r?.name === 'subtitles');
@@ -190,7 +197,7 @@ export function getSubtitleAddons(addons, type, id) {
  */
 export function getMetaAddons(addons, type, id) {
     return addons.filter(addon => {
-        const manifest = addon.manifest;
+        const manifest = resolveManifest(addon);
         if (!manifest) return false;
 
         const resources = manifest.resources || [];
