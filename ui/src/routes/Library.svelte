@@ -8,10 +8,25 @@
   let loading = true;
   let error = '';
   let items = [];
+  let groupBy = 'type';
+  let sortBy = 'updated';
+  let sortOrder = 'desc';
+  let statusFilter = 'all';
 
-  $: movies = items.filter(item => item.type === 'movie');
-  $: series = items.filter(item => item.type === 'series');
-  $: other = items.filter(item => item.type !== 'movie' && item.type !== 'series');
+  $: filteredItems = statusFilter === 'all'
+    ? items
+    : items.filter(item => watchStatus(item) === statusFilter);
+
+  $: sortedItems = [...filteredItems].sort((a, b) => {
+    const dir = sortOrder === 'asc' ? 1 : -1;
+    const av = sortValue(a, sortBy);
+    const bv = sortValue(b, sortBy);
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+    return 0;
+  });
+
+  $: grouped = groupItems(sortedItems, groupBy);
 
   onMount(async () => {
     await loadLibrary();
@@ -34,6 +49,13 @@
 
   function goToMeta(item) {
     push(`/meta/${item.type || 'movie'}/${item.id}`);
+  }
+
+  function sortValue(item, mode) {
+    if (mode === 'name') return String(item?.name || '').toLowerCase();
+    if (mode === 'year') return Number(item?.year || 0);
+    if (mode === 'progress') return progressPct(item);
+    return new Date(item?.updatedAt || item?.state?.lastWatched || 0).getTime();
   }
 
   function progressPct(item) {
@@ -67,12 +89,73 @@
     if (season > 0 && episode > 0) return `Last: S${season}E${episode}`;
     return '';
   }
+
+  function groupKey(item, mode) {
+    if (mode === 'status') {
+      const status = watchStatus(item);
+      if (status === 'watched') return 'Watched';
+      if (status === 'partial') return 'In Progress';
+      return 'Unwatched';
+    }
+    if (mode === 'year') {
+      return item?.year ? String(item.year) : 'Unknown Year';
+    }
+    if (mode === 'none') {
+      return 'All Items';
+    }
+    if (item?.type === 'movie') return 'Movies';
+    if (item?.type === 'series') return 'Series';
+    return 'Other';
+  }
+
+  function groupItems(list, mode) {
+    const map = new Map();
+    for (const item of list) {
+      const key = groupKey(item, mode);
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(item);
+    }
+    return [...map.entries()];
+  }
 </script>
 
 <div class="library-page">
   <div class="library-header">
     <h1>My Library</h1>
     <p>Synced from your Stremio account</p>
+  </div>
+
+  <div class="toolbar">
+    <label>Group
+      <select bind:value={groupBy} data-focusable="true">
+        <option value="type">By Type</option>
+        <option value="status">By Status</option>
+        <option value="year">By Year</option>
+        <option value="none">Single Group</option>
+      </select>
+    </label>
+    <label>Sort
+      <select bind:value={sortBy} data-focusable="true">
+        <option value="updated">Recently Updated</option>
+        <option value="name">Name</option>
+        <option value="year">Year</option>
+        <option value="progress">Progress</option>
+      </select>
+    </label>
+    <label>Order
+      <select bind:value={sortOrder} data-focusable="true">
+        <option value="desc">Descending</option>
+        <option value="asc">Ascending</option>
+      </select>
+    </label>
+    <label>Status
+      <select bind:value={statusFilter} data-focusable="true">
+        <option value="all">All</option>
+        <option value="watched">Watched</option>
+        <option value="partial">In Progress</option>
+        <option value="unwatched">Unwatched</option>
+      </select>
+    </label>
   </div>
 
   {#if loading}
@@ -82,32 +165,16 @@
       <p>{error}</p>
       <button data-focusable="true" class="retry-btn" on:click={loadLibrary}>Retry</button>
     </div>
-  {:else if items.length === 0}
+  {:else if sortedItems.length === 0}
     <div class="state-box">No synced library items yet.</div>
   {:else}
-    {#if movies.length}
+    {#each grouped as [groupName, groupItems]}
       <section class="group">
-        <h2>Movies · {movies.length}</h2>
+        <h2>{groupName} · {groupItems.length}</h2>
         <div class="grid">
-          {#each movies as item (item.id)}
+          {#each groupItems as item (item.id)}
             <div class="card-wrap" on:click={() => goToMeta(item)}>
-              <MetaCard meta={item} defaultType="movie" />
-              <div class="status-row {watchStatus(item)}">
-                <span>{statusLabel(item)}</span>
-              </div>
-            </div>
-          {/each}
-        </div>
-      </section>
-    {/if}
-
-    {#if series.length}
-      <section class="group">
-        <h2>Series · {series.length}</h2>
-        <div class="grid">
-          {#each series as item (item.id)}
-            <div class="card-wrap" on:click={() => goToMeta(item)}>
-              <MetaCard meta={item} defaultType="series" />
+              <MetaCard meta={item} defaultType={item.type || 'movie'} />
               <div class="status-row {watchStatus(item)}">
                 <span>{statusLabel(item)}</span>
                 {#if episodeLabel(item)}
@@ -118,23 +185,7 @@
           {/each}
         </div>
       </section>
-    {/if}
-
-    {#if other.length}
-      <section class="group">
-        <h2>Other · {other.length}</h2>
-        <div class="grid">
-          {#each other as item (item.id)}
-            <div class="card-wrap" on:click={() => goToMeta(item)}>
-              <MetaCard meta={item} defaultType={item.type || 'movie'} />
-              <div class="status-row {watchStatus(item)}">
-                <span>{statusLabel(item)}</span>
-              </div>
-            </div>
-          {/each}
-        </div>
-      </section>
-    {/if}
+    {/each}
   {/if}
 </div>
 
@@ -160,6 +211,33 @@
 
   .group {
     margin-bottom: 24px;
+  }
+
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+
+  .toolbar label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 6px 10px;
+  }
+
+  .toolbar select {
+    background: transparent;
+    color: var(--text-primary);
+    border: none;
+    outline: none;
+    font-size: 0.82rem;
   }
 
   .group h2 {

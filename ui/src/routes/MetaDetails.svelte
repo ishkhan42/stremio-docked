@@ -10,7 +10,7 @@
     fetchStreams,
     fetchSubtitles,
   } from '../lib/addons.js';
-  import { resolveStreamUrl, imageProxyUrl } from '../lib/api.js';
+  import { resolveStreamUrl, imageProxyUrl, getLibraryContains, addLibraryItem, removeLibraryItem } from '../lib/api.js';
   import { savePlayerState } from '../lib/storage.js';
   import EpisodeGrid    from '../components/EpisodeGrid.svelte';
   import StreamPicker   from '../components/StreamPicker.svelte';
@@ -50,6 +50,8 @@
 
   // Subtitles for stream
   let subtitles  = [];
+  let inLibrary = false;
+  let libraryBusy = false;
 
   // ── Fetch meta ─────────────────────────────────────────────────────────────
   // Use reactive statement only — avoids double-fetch from onMount + $:
@@ -95,10 +97,50 @@
       }
 
       if (!meta) throw new Error('This title was not found in any of your add-ons.');
+
+      await refreshLibraryStatus();
     } catch (e) {
       loadError = e.message;
     } finally {
       loading = false;
+    }
+  }
+
+  async function refreshLibraryStatus() {
+    if (!$authKey || !id) {
+      inLibrary = false;
+      return;
+    }
+    try {
+      const check = await getLibraryContains($authKey, id, type || 'movie');
+      inLibrary = !!check?.inLibrary;
+    } catch {
+      inLibrary = false;
+    }
+  }
+
+  async function toggleLibrary() {
+    if (!$authKey || !meta || libraryBusy) return;
+    libraryBusy = true;
+    try {
+      if (inLibrary) {
+        await removeLibraryItem($authKey, id, type || 'movie');
+      } else {
+        await addLibraryItem({
+          authKey: $authKey,
+          id,
+          type: type || 'movie',
+          name: meta?.name || '',
+          poster: meta?.poster || '',
+          background: meta?.background || '',
+          year: meta?.year || '',
+        });
+      }
+      await refreshLibraryStatus();
+    } catch (err) {
+      alert(`Library sync failed: ${err.message}`);
+    } finally {
+      libraryBusy = false;
     }
   }
 
@@ -319,6 +361,15 @@
             <!-- For series, there's an episode browser below -->
             <span class="series-hint">Select an episode below</span>
           {/if}
+
+          <button
+            class="btn-secondary"
+            data-focusable="true"
+            disabled={libraryBusy}
+            on:click={toggleLibrary}
+          >
+            {libraryBusy ? 'Syncing…' : inLibrary ? 'Remove from Library' : 'Add to Library'}
+          </button>
 
           <!-- Resume button if progress exists -->
           {#if type === 'movie'}

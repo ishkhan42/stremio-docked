@@ -6,8 +6,10 @@
 const BASE = '/api';
 
 async function call(path, opts = {}) {
+    const method = String(opts?.method || 'GET').toUpperCase();
     const res = await fetch(BASE + path, {
         headers: { 'Content-Type': 'application/json' },
+        cache: method === 'GET' ? 'no-store' : 'default',
         ...opts,
     });
     const data = await res.json();
@@ -46,6 +48,25 @@ export async function getLibrary(authKey, options = {}) {
     if (options.type) params.set('type', options.type);
     if (options.limit) params.set('limit', String(options.limit));
     return call(`/library?${params.toString()}`);
+}
+
+export async function getLibraryContains(authKey, id, type = 'movie') {
+    const params = new URLSearchParams({ authKey, id, type });
+    return call(`/library/contains?${params.toString()}`);
+}
+
+export async function addLibraryItem({ authKey, id, type = 'movie', name = '', poster = '', background = '', year = '' }) {
+    return call('/library/item', {
+        method: 'POST',
+        body: JSON.stringify({ authKey, id, type, name, poster, background, year }),
+    });
+}
+
+export async function removeLibraryItem(authKey, id, type = 'movie') {
+    const params = new URLSearchParams({ authKey, id, type });
+    return call(`/library/item?${params.toString()}`, {
+        method: 'DELETE',
+    });
 }
 
 export async function getRecentlyPlayed(authKey, limit = 20) {

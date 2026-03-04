@@ -42,6 +42,7 @@ function ffprobe(url, timeoutMs = 15000) {
 }
 
 const app = express();
+app.set('etag', false);
 const PORT = 3001;
 const STREMIO_SERVER = process.env.STREMIO_SERVER_URL || 'http://127.0.0.1:11470';
 const STREMIO_API = 'https://api.strem.io';
@@ -496,8 +497,10 @@ async function stremioApiCall(path, body) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`Stremio API error: ${res.status}`);
-    return res.json();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error?.message || data?.error || `Stremio API error: ${res.status}`);
+    if (data?.error) throw new Error(data?.error?.message || data.error || 'Stremio API error');
+    return data;
 }
 
 /** Generic JSON GET from a URL (used for add-on calls). */
@@ -516,6 +519,100 @@ async function fetchJson(url, timeoutMs = 10000) {
 function toNumber(value, fallback) {
     const n = Number(value);
     return Number.isFinite(n) ? n : fallback;
+}
+
+function canonicalLibraryId(rawId = '', type = '') {
+    const id = String(rawId || '').trim();
+    if (!id) return '';
+    const loweredType = String(type || '').toLowerCase();
+    const match = id.match(/^(movie|series):(.*)$/i);
+    if (match && match[2]) return match[2];
+    if (loweredType && id.startsWith(`${loweredType}:`)) {
+        return id.slice(loweredType.length + 1);
+    }
+    return id;
+}
+
+function parseSeasonEpisode(videoId = '') {
+    const str = String(videoId || '');
+    const match = str.match(/^[^:]+:(\d+):(\d+)/);
+    if (!match) return { season: 0, episode: 0 };
+    return {
+        season: Number(match[1]) || 0,
+        episode: Number(match[2]) || 0,
+    };
+}
+
+async function putLibraryItem(authKey, itemId, item) {
+    await stremioApiCall('/api/datastorePut', {
+        authKey,
+        collection: 'libraryItem',
+        changes: [item],
+    });
+    return { ok: true, id: itemId };
+}
+
+async function getLibraryItems(authKey, { ids = [], all = false } = {}) {
+    const response = await stremioApiCall('/api/datastoreGet', {
+        authKey,
+        collection: 'libraryItem',
+        ids: Array.isArray(ids) ? ids : [],
+        all: !!all,
+    });
+    return Array.isArray(response?.result) ? response.result : [];
+}
+
+function emptyLibraryState(lastWatched = null) {
+    return {
+        lastWatched,
+        timeWatched: 0,
+        timeOffset: 0,
+        overallTimeWatched: 0,
+        timesWatched: 0,
+        flaggedWatched: 0,
+        duration: 0,
+        video_id: null,
+        watched: null,
+        noNotif: false,
+        season: 0,
+        episode: 0,
+    };
+}
+
+function defaultBehaviorHints() {
+    return {
+        defaultVideoId: null,
+        featuredVideoId: null,
+        hasScheduledVideos: false,
+    };
+}
+
+function toLibraryItemPayload({
+    id,
+    type,
+    name,
+    poster,
+    posterShape,
+    state,
+    removed,
+    ctime,
+    mtime,
+    temp,
+    behaviorHints,
+}) {
+    return {
+        _id: String(id || ''),
+        name: String(name || id || 'Unknown'),
+        type: String(type || 'movie'),
+        poster: poster || null,
+        posterShape: String(posterShape || 'poster'),
+        removed: !!removed,
+        temp: !!temp,
+        _ctime: String(ctime || new Date().toISOString()),
+        _mtime: String(mtime || new Date().toISOString()),
+        state: state || emptyLibraryState(null),
+        behaviorHints: behaviorHints || defaultBehaviorHints(),
+    };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -596,19 +693,15 @@ app.get('/addons', async (req, res) => {
 
 app.get('/library', async (req, res) => {
     try {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
         const { authKey, type = 'all' } = req.query;
         const limit = Math.max(1, Math.min(500, toNumber(req.query.limit, 500)));
 
         if (!authKey) return res.status(400).json({ error: 'Missing authKey' });
 
-        const data = await stremioApiCall('/api/datastoreGet', {
-            type: 'DatastoreGet',
-            authKey,
-            collection: 'libraryItem',
-            all: true,
-        });
+        const data = await getLibraryItems(authKey, { all: true, ids: [] });
 
-        let items = normalizeLibraryItems(data);
+        let items = normalizeLibraryItems({ result: data });
         if (type !== 'all') {
             items = items.filter(item => item.type === type);
         }
@@ -625,21 +718,112 @@ app.get('/library', async (req, res) => {
     }
 });
 
+app.get('/library/contains', async (req, res) => {
+    try {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+        const authKey = String(req.query?.authKey || '');
+        const id = String(req.query?.id || '');
+        const type = String(req.query?.type || 'movie');
+
+        if (!authKey) return res.status(400).json({ error: 'Missing authKey' });
+        if (!id) return res.status(400).json({ error: 'Missing id' });
+
+        const data = await getLibraryItems(authKey, { all: true, ids: [] });
+
+        const items = normalizeLibraryItems({ result: data });
+        const target = canonicalLibraryId(id, type);
+        const found = items.find((item) => {
+            const raw = String(item.id || '');
+            const itemCanonical = canonicalLibraryId(raw, item.type || type);
+            return raw === id || raw === `${type}:${id}` || itemCanonical === target;
+        });
+        return res.json({ inLibrary: !!found, item: found || null });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/library/item', async (req, res) => {
+    try {
+        const authKey = String(req.body?.authKey || '');
+        const id = String(req.body?.id || req.body?.mediaId || '');
+        const type = String(req.body?.type || 'movie');
+        const name = String(req.body?.name || id || 'Unknown');
+        const poster = String(req.body?.poster || '') || null;
+        const nowIso = new Date().toISOString();
+
+        if (!authKey) return res.status(400).json({ error: 'Missing authKey' });
+        if (!id) return res.status(400).json({ error: 'Missing id' });
+
+        const existing = await getLibraryItems(authKey, { ids: [id], all: false });
+        const prev = existing.find(item => String(item?._id || '') === id) || null;
+
+        const item = toLibraryItemPayload({
+            id,
+            type: prev?.type || type,
+            name: prev?.name || name,
+            poster: prev?.poster || poster,
+            posterShape: prev?.posterShape || 'poster',
+            state: prev?.state || emptyLibraryState(nowIso),
+            removed: false,
+            temp: false,
+            ctime: prev?._ctime || nowIso,
+            mtime: nowIso,
+            behaviorHints: prev?.behaviorHints || defaultBehaviorHints(),
+        });
+
+        await putLibraryItem(authKey, id, item);
+        return res.json({ ok: true, id });
+    } catch (err) {
+        return res.status(500).json({ error: `Library add failed: ${err.message}` });
+    }
+});
+
+app.delete('/library/item', async (req, res) => {
+    try {
+        const authKey = String(req.query?.authKey || '');
+        const id = String(req.query?.id || '');
+        const type = String(req.query?.type || 'movie');
+        const nowIso = new Date().toISOString();
+
+        if (!authKey) return res.status(400).json({ error: 'Missing authKey' });
+        if (!id) return res.status(400).json({ error: 'Missing id' });
+
+        const existing = await getLibraryItems(authKey, { ids: [id], all: false });
+        const prev = existing.find(item => String(item?._id || '') === id) || null;
+
+        const tombstone = toLibraryItemPayload({
+            id,
+            type: prev?.type || type,
+            name: prev?.name || id,
+            poster: prev?.poster || null,
+            posterShape: prev?.posterShape || 'poster',
+            state: prev?.state || emptyLibraryState(null),
+            removed: true,
+            temp: false,
+            ctime: prev?._ctime || nowIso,
+            mtime: nowIso,
+            behaviorHints: prev?.behaviorHints || defaultBehaviorHints(),
+        });
+
+        await putLibraryItem(authKey, id, tombstone);
+        return res.json({ ok: true, id });
+    } catch (err) {
+        return res.status(500).json({ error: `Library remove failed: ${err.message}` });
+    }
+});
+
 app.get('/recently-played', async (req, res) => {
     try {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
         const { authKey } = req.query;
         const limit = Math.max(1, Math.min(200, toNumber(req.query.limit, 30)));
 
         if (!authKey) return res.status(400).json({ error: 'Missing authKey' });
 
-        const data = await stremioApiCall('/api/datastoreGet', {
-            type: 'DatastoreGet',
-            authKey,
-            collection: 'libraryItem',
-            all: true,
-        });
+        const data = await getLibraryItems(authKey, { all: true, ids: [] });
 
-        const items = normalizeLibraryItems(data)
+        const items = normalizeLibraryItems({ result: data })
             .filter(item => item.state?.lastWatched)
             .sort((a, b) => {
                 const at = new Date(a.state?.lastWatched || 0).getTime();
@@ -987,6 +1171,7 @@ app.post('/recently-played/sync', async (req, res) => {
     try {
         const authKey = String(req.body?.authKey || '');
         const mediaId = String(req.body?.mediaId || req.body?.videoId || '');
+        const videoId = String(req.body?.videoId || mediaId || '');
         const type = String(req.body?.type || 'movie');
         const name = String(req.body?.name || req.body?.metaName || mediaId || 'Unknown');
         const poster = String(req.body?.poster || req.body?.metaPoster || '');
@@ -997,7 +1182,7 @@ app.post('/recently-played/sync', async (req, res) => {
         if (!authKey) return res.status(400).json({ error: 'Missing authKey' });
         if (!mediaId) return res.status(400).json({ error: 'Missing mediaId/videoId' });
 
-        const dedupeKey = `${authKey}:${type}:${mediaId}`;
+        const dedupeKey = `${authKey}:${type}:${mediaId}:${videoId}`;
         const now = Date.now();
         const lastAt = recentSyncLastAt.get(dedupeKey) || 0;
         if (now - lastAt < SYNC_MIN_INTERVAL_MS) {
@@ -1005,46 +1190,47 @@ app.post('/recently-played/sync', async (req, res) => {
         }
         recentSyncLastAt.set(dedupeKey, now);
 
+        const { season, episode } = parseSeasonEpisode(videoId);
+        const safeDuration = Math.floor(duration);
+        const safePosition = Math.floor(position);
+
         const state = {
-            timeOffset: Math.floor(position),
-            duration: Math.floor(duration),
+            timeOffset: safePosition,
+            timeWatched: safePosition,
+            overallTimeWatched: safePosition,
+            duration: safeDuration,
+            video_id: videoId,
+            noNotif: false,
+            flaggedWatched: 0,
+            timesWatched: 0,
+            watched: '',
+            season,
+            episode,
             lastWatched: new Date(now).toISOString(),
         };
 
-        const itemId = mediaId.includes(':') ? mediaId : `${type}:${mediaId}`;
-        const item = {
-            _id: itemId,
-            type,
-            name,
-            poster,
-            background,
-            state,
-            mtime: now,
+        const itemId = String(mediaId || '');
+        const existing = await getLibraryItems(authKey, { ids: [itemId], all: false });
+        const prev = existing.find(item => String(item?._id || '') === itemId) || null;
+        const mergedState = {
+            ...(prev?.state || emptyLibraryState(null)),
+            ...state,
         };
+        const item = toLibraryItemPayload({
+            id: itemId,
+            type: prev?.type || type,
+            name: prev?.name || name,
+            poster: prev?.poster || poster || null,
+            posterShape: prev?.posterShape || 'poster',
+            state: mergedState,
+            removed: false,
+            temp: false,
+            ctime: prev?._ctime || new Date(now).toISOString(),
+            mtime: new Date(now).toISOString(),
+            behaviorHints: prev?.behaviorHints || defaultBehaviorHints(),
+        });
 
-        const payloads = [
-            { type: 'DatastorePut', authKey, collection: 'libraryItem', key: itemId, value: item },
-            { type: 'DatastorePut', authKey, collection: 'libraryItem', item },
-            { type: 'DatastorePut', authKey, collection: 'libraryItem', changes: [item] },
-        ];
-
-        let synced = false;
-        let lastError = null;
-        for (const payload of payloads) {
-            try {
-                const response = await stremioApiCall('/api/datastorePut', payload);
-                if (response?.result || response?.ok || response === true) {
-                    synced = true;
-                    break;
-                }
-            } catch (err) {
-                lastError = err;
-            }
-        }
-
-        if (!synced) {
-            return res.status(502).json({ error: `Stremio sync failed: ${lastError?.message || 'unknown error'}` });
-        }
+        await putLibraryItem(authKey, itemId, item);
 
         return res.json({ ok: true, id: itemId });
     } catch (err) {
