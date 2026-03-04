@@ -9,8 +9,8 @@ export const addonsLoading = writable(false);
 export const addonsError = writable(null);
 
 /** Fetch addon collection for the current user. */
-export async function loadAddons() {
-    const key = storeGet(authKey);
+export async function loadAddons(keyOverride) {
+    const key = keyOverride || storeGet(authKey);
     if (!key) return;
     addonsLoading.set(true);
     addonsError.set(null);

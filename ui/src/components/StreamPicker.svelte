@@ -220,4 +220,16 @@
   .seeds, .size { white-space: nowrap; }
 
   .stream-arrow { color: var(--text-dim); flex-shrink: 0; }
+
+  /* ── TV-scale ──────────────────────────────── */
+  @media (min-width: 960px) {
+    .chip          { padding: 7px 18px; font-size: 0.9rem; }
+    .stream-item   { padding: 16px 18px; gap: 14px; }
+    .stream-name   { font-size: 0.95rem; }
+    .stream-desc   { font-size: 0.84rem; }
+    .badge         { font-size: 0.74rem; padding: 3px 9px; }
+    .stream-stats  { font-size: 0.84rem; }
+    .stream-list   { max-height: 450px; }
+    .stream-arrow svg { width: 18px; height: 18px; }
+  }
 </style>

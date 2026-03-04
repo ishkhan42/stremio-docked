@@ -183,4 +183,17 @@
     color: var(--red);
     background: rgba(239,68,68,0.1);
   }
+
+  /* ── TV-scale ──────────────────────────────────────────── */
+  @media (min-width: 960px) {
+    .navbar   { padding: 0 var(--page-x, 48px); gap: 36px; }
+    .logo     { font-size: 1.35rem; }
+    .logo svg { width: 32px; height: 32px; }
+    .nav-btn  { padding: 10px 22px; font-size: 1rem; gap: 10px; }
+    .nav-btn svg { width: 20px; height: 20px; }
+    .avatar   { width: 38px; height: 38px; }
+    .email    { font-size: 0.9rem; }
+    .logout-btn { width: 40px; height: 40px; }
+    .logout-btn svg { width: 22px; height: 22px; }
+  }
 </style>

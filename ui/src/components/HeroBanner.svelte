@@ -9,6 +9,7 @@
   let currentIndex = 0;
   let timer;
   let loading = true;
+  let destroyed = false;
 
   $: current = items[currentIndex] || null;
 
@@ -29,6 +30,7 @@
 
     try {
       const res = await fetchCatalog(cinemetaAddon, 'movie', 'top');
+      if (destroyed) return;  // guard: component already torn down
       items = (res.metas || []).slice(0, 10);
     } catch (e) {
       // hero silent fail
@@ -36,14 +38,14 @@
       loading = false;
     }
 
-    if (items.length > 1) {
+    if (!destroyed && items.length > 1) {
       timer = setInterval(() => {
         currentIndex = (currentIndex + 1) % items.length;
       }, 7000);
     }
   });
 
-  onDestroy(() => { clearInterval(timer); });
+  onDestroy(() => { destroyed = true; clearInterval(timer); });
 
   function goTo(idx) {
     currentIndex = idx;
@@ -260,5 +262,20 @@
   @keyframes shimmer {
     0%   { background-position: 200% 0; }
     100% { background-position: -200% 0; }
+  }
+
+  /* ── TV-scale ──────────────────────────────────────────── */
+  @media (min-width: 960px) {
+    .hero          { height: 560px; }
+    .hero-content  { padding: 90px 64px 0; max-width: 680px; gap: 18px; }
+    .hero-title    { font-size: 2.8rem; }
+    .hero-desc     { font-size: 1.05rem; max-width: 560px; }
+    .badge         { font-size: 0.88rem; padding: 4px 12px; }
+    .btn-primary, .btn-secondary { padding: 14px 32px; font-size: 1rem; }
+    .hero-dots     { bottom: 32px; left: 64px; gap: 10px; }
+    .dot           { width: 10px; height: 10px; }
+    .dot.active    { width: 28px; }
+    .hero-skeleton { height: 560px; }
+    .hero-logo     { max-width: 360px; max-height: 120px; }
   }
 </style>

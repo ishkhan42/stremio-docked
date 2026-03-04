@@ -83,8 +83,27 @@
     --bg-surface:    #1c1c2e;
     --nav-h:         72px;
     --page-x:        40px;
+    --card-w:        150px;
+    --card-w-lg:     200px;
     --transition:    200ms ease;
     font-size: 16px;
+  }
+
+  /* TV-scale: increase base sizing on HD+ screens */
+  @media (min-width: 960px) {
+    :global(:root) {
+      --nav-h:     80px;
+      --page-x:    48px;
+      --card-w:    175px;
+      --card-w-lg: 230px;
+    }
+  }
+
+  @media (min-width: 1400px) {
+    :global(:root) {
+      --card-w:    190px;
+      --card-w-lg: 250px;
+    }
   }
 
   :global(html), :global(body), :global(#app) {

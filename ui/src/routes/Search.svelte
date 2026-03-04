@@ -11,6 +11,7 @@
   let loading    = false;
   let debounceTimer;
   let inputEl;
+  let searchSeq  = 0;   // guards stale search responses
 
   $: groupedResults = groupByType(results);
   $: groupedEntries = Object.entries(groupedResults);
@@ -31,6 +32,7 @@
   async function doSearch() {
     const q = query.trim();
     if (!q) { loading = false; return; }
+    const seq = ++searchSeq;
 
     const addons = get(addonsStore);
     if (!addons.length) { loading = false; results = []; return; }
@@ -52,6 +54,8 @@
         fetchCatalog(addon, catalog.type, catalog.id, { search: q })
       )
     );
+
+    if (seq !== searchSeq) return; // stale — a newer search is in flight
 
     // Deduplicate by id
     const seen = new Set();

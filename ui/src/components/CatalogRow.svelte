@@ -146,4 +146,16 @@
     font-size: 0.85rem;
     padding: 24px 0;
   }
+
+  /* ── TV-scale ─────────────────────────── */
+  @media (min-width: 960px) {
+    .row-header    { padding: 0 var(--page-x, 48px) 14px; }
+    .row-title     { font-size: 1.3rem; }
+    .addon-name    { font-size: 0.85rem; }
+    .items-track   { gap: 18px; padding: 10px var(--page-x, 48px); }
+    .scroll-btn    { width: 48px; height: 90px; }
+    .skeleton-card { width: var(--card-w, 175px); }
+    .skeleton-card.large { width: var(--card-w-lg, 230px); }
+    .catalog-row   { padding-bottom: 36px; }
+  }
 </style>

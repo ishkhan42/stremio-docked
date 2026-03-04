@@ -15,6 +15,7 @@ const fetch = require('node-fetch');
 const https = require('https');
 const http = require('http');
 const { Readable } = require('stream');
+const { normalizeStreamUrl, extractHashFileFromPath, srtToVtt, normalizeLibraryItems } = require('./utils');
 
 const app = express();
 const PORT = 3001;
@@ -65,69 +66,6 @@ async function fetchJson(url, timeoutMs = 10000) {
 function toNumber(value, fallback) {
     const n = Number(value);
     return Number.isFinite(n) ? n : fallback;
-}
-
-function normalizeLibraryItems(data) {
-    const raw = Array.isArray(data?.result)
-        ? data.result
-        : Array.isArray(data)
-            ? data
-            : Array.isArray(data?.result?.items)
-                ? data.result.items
-                : [];
-
-    return raw
-        .filter(item => item && item._id && !item.removed)
-        .map(item => ({
-            id: item._id,
-            type: item.type || 'movie',
-            name: item.name || item._id,
-            poster: item.poster || '',
-            background: item.background || '',
-            year: item.year || '',
-            posterShape: item.posterShape || 'poster',
-            state: item.state || {},
-            updatedAt: item._mtime || item._ctime || null,
-            createdAt: item._ctime || null,
-        }));
-}
-
-function normalizeStreamUrl(url, host) {
-    if (!url || typeof url !== 'string') return url;
-
-    const publicHost = host || '';
-    const localMediaPath = /^\/([a-f0-9]{40}|stream|hlsv2)\//i;
-
-    if (url.startsWith('/')) {
-        if (publicHost) {
-            return `${publicHost}/ss${url}`;
-        }
-        return `/ss${url}`;
-    }
-
-    try {
-        const parsed = new URL(url);
-        const isLocalServer =
-            parsed.hostname === '127.0.0.1' ||
-            parsed.hostname === 'localhost' ||
-            parsed.port === '11470';
-
-        const looksLikeLocalMedia = localMediaPath.test(parsed.pathname);
-
-        if ((isLocalServer || looksLikeLocalMedia) && publicHost) {
-            return `${publicHost}/ss${parsed.pathname}${parsed.search || ''}`;
-        }
-
-        return url;
-    } catch {
-        return url;
-    }
-}
-
-function extractHashFileFromPath(pathname = '') {
-    const match = pathname.match(/^\/([a-f0-9]{40})\/(\d+)(?:\/.*)?$/i);
-    if (!match) return null;
-    return { infoHash: match[1].toLowerCase(), fileIdx: Number(match[2]) || 0 };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -457,20 +395,6 @@ app.get('/subtitle-proxy', async (req, res) => {
     }
 });
 
-/** Minimal SRT → WebVTT converter */
-function srtToVtt(srt) {
-    let vtt = 'WEBVTT\n\n';
-    vtt += srt
-        .replace(/\r\n/g, '\n')
-        .replace(/\r/g, '\n')
-        // Convert SRT timestamps (00:00:00,000) to VTT (00:00:00.000)
-        .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2')
-        // Remove <i>, <b>, <u> HTML tags (optional — VTT supports them but keep safe)
-        // Keep as-is; VTT supports basic HTML
-        .trim();
-    return vtt;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Image proxy /image-proxy?url=...
 // Proxies poster/thumbnail images to avoid CORS/mixed-content issues on TV
@@ -490,6 +414,7 @@ app.get('/image-proxy', async (req, res) => {
         const contentType = upstream.headers.get('content-type') || 'image/jpeg';
         res.setHeader('Content-Type', contentType);
         res.setHeader('Cache-Control', 'public, max-age=86400'); // 24h cache
+        upstream.body.on('error', () => { if (!res.headersSent) res.status(502).end(); else res.end(); });
         upstream.body.pipe(res);
     } catch (err) {
         res.status(502).send(err.message);

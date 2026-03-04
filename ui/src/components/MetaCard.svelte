@@ -8,7 +8,7 @@
 
   $: resolvedType = meta?.type || defaultType;
   $: progress = getProgress(resolvedType, meta.id);
-  $: progressPct = progress ? Math.min((progress.position / progress.duration) * 100, 100) : 0;
+  $: progressPct = (progress && progress.duration > 0) ? Math.min((progress.position / progress.duration) * 100, 100) : 0;
 
   function navigate() {
     push(`/meta/${resolvedType}/${meta.id}`);
@@ -89,8 +89,8 @@
     outline: none;
   }
 
-  .meta-card.size-normal { width: 150px; }
-  .meta-card.size-large  { width: 200px; }
+  .meta-card.size-normal { width: var(--card-w, 150px); }
+  .meta-card.size-large  { width: var(--card-w-lg, 200px); }
   .meta-card.size-small  { width: 110px; }
 
   .poster-wrap {
@@ -206,5 +206,17 @@
     font-size: 0.75rem;
     color: #f59e0b;
     margin-top: 2px;
+  }
+
+  /* ── TV-scale ────────────────────────── */
+  @media (min-width: 960px) {
+    .meta-info { padding: 10px 5px 3px; }
+    .meta-name { font-size: 0.92rem; }
+    .meta-year { font-size: 0.8rem; }
+    .meta-rating { font-size: 0.8rem; }
+    .progress-bar { height: 5px; }
+    .type-badge { font-size: 0.7rem; padding: 3px 8px; }
+    .play-btn { width: 54px; height: 54px; }
+    .play-btn svg { width: 24px; height: 24px; }
   }
 </style>

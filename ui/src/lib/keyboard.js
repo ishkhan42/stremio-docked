@@ -48,6 +48,10 @@ function focusEl(el) {
     // Remove focus from previous
     document.querySelectorAll('.focused').forEach(e => e.classList.remove('focused'));
     el.classList.add('focused');
+    // For form controls, also give real browser focus so users can type
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)) {
+        el.focus();
+    }
     // Scroll into view smoothly
     el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
 }
@@ -147,6 +151,16 @@ function onKeyDown(e) {
         if (current) {
             e.preventDefault();
             current.click();
+        }
+        return;
+    }
+
+    // ── Back / Escape ──────────────────────────────────────────────────────
+    if (matchKey(e, 'BACK')) {
+        // Let the browser go back in SPA history (svelte-spa-router uses hash)
+        if (window.history.length > 1) {
+            e.preventDefault();
+            window.history.back();
         }
         return;
     }

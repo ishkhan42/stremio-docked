@@ -102,12 +102,12 @@ export function getContinueWatching() {
 // ── User preferences ─────────────────────────────────────────────────────────
 
 export const defaultPrefs = {
-    preferredQuality: 'auto',   // '4K' | '1080p' | '720p' | 'auto'
+    quality: 'auto',            // '4K' | '1080p' | '720p' | 'auto'
     subtitleLanguage: 'eng',
     audioLanguage: 'eng',
-    subtitleSize: 100,           // %
-    autoPlay: true,
-    bingeWatching: true,
+    subtitleSize: 'medium',      // 'small' | 'medium' | 'large' | 'xlarge'
+    autoPlayNext: true,
+    volume: 1,                   // 0–1
 };
 
 export function loadPrefs() {

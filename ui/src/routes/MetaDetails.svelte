@@ -1,5 +1,4 @@
 <script>
-  import { onMount } from 'svelte';
   import { push, pop } from 'svelte-spa-router';
   import { metaAddons, streamAddons, subtitleAddons } from '../stores/addons.js';
   import { getProgress }  from '../stores/progress.js';
@@ -51,11 +50,15 @@
   let subtitles  = [];
 
   // ── Fetch meta ─────────────────────────────────────────────────────────────
-  onMount(async () => {
-    await fetchMetaData();
-  });
-
-  $: if (params.type && params.id) fetchMetaData();
+  // Use reactive statement only — avoids double-fetch from onMount + $:
+  let lastFetchedKey = '';
+  $: {
+    const key = `${params.type}/${params.id}`;
+    if (params.type && params.id && key !== lastFetchedKey) {
+      lastFetchedKey = key;
+      fetchMetaData();
+    }
+  }
 
   async function fetchMetaData() {
     loading   = true;
@@ -83,11 +86,14 @@
   }
 
   // ── Streams ────────────────────────────────────────────────────────────────
+  let streamReqSeq = 0;   // guards stale stream results
+
   async function openStreams(videoId) {
     streams = [];
     subtitles = [];
     loadingStreams = true;
     showStreamPicker = true;
+    const seq = ++streamReqSeq;
 
     const sAddons  = streamAddons(type, videoId);
     const stAddons = subtitleAddons(type, videoId);
@@ -96,6 +102,7 @@
     const streamResults = await Promise.allSettled(
       sAddons.map(a => fetchStreams(a, type, videoId))
     );
+    if (seq !== streamReqSeq) return; // stale — user selected another episode
     streams = streamResults
       .filter(r => r.status === 'fulfilled' && Array.isArray(r.value?.streams))
       .flatMap(r => r.value.streams);
@@ -104,6 +111,7 @@
     const subResults = await Promise.allSettled(
       stAddons.map(a => fetchSubtitles(a, type, videoId, {}))
     );
+    if (seq !== streamReqSeq) return;
     subtitles = subResults
       .filter(r => r.status === 'fulfilled' && Array.isArray(r.value?.subtitles))
       .flatMap(r => r.value.subtitles);
@@ -143,7 +151,7 @@
       directUrl:      resolved.url    || '',
       streamType:     resolved.type   || 'http',
       title:          selectedEpisode
-        ? `${meta?.name} – S${selectedEpisode.season}E${selectedEpisode.number} ${selectedEpisode.title || ''}`
+        ? `${meta?.name} – S${selectedEpisode.season}E${selectedEpisode.episode || selectedEpisode.number || '?'} ${selectedEpisode.title || selectedEpisode.name || ''}`
         : (meta?.name || ''),
       metaName:       meta?.name || '',
       metaPoster:     meta?.poster || '',
@@ -563,5 +571,21 @@
     border-radius: var(--radius-sm);
     color: #fff;
     font-weight: 600;
+  }
+
+  /* ── TV-scale ────────────────────────────────────────────────── */
+  @media (min-width: 960px) {
+    .hero-section  { gap: 48px; padding: 110px var(--page-x) 52px; }
+    .poster        { width: 230px; }
+    .poster-placeholder { width: 230px; height: 345px; }
+    .title         { font-size: 2.8rem; }
+    .meta-tag      { font-size: 0.9rem; padding: 4px 12px; }
+    .genres        { font-size: 0.95rem; }
+    .description   { font-size: 1rem; max-width: 650px; }
+    .cast          { font-size: 0.88rem; }
+    .btn-primary   { font-size: 1.08rem; padding: 15px 36px; }
+    .btn-secondary { font-size: 1rem; padding: 15px 28px; }
+    .back-btn      { font-size: 0.95rem; padding: 10px 14px; }
+    .modal-box     { max-width: 780px; }
   }
 </style>

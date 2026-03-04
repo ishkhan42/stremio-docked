@@ -89,8 +89,9 @@
           {#if video.released}
             <p class="ep-date">{formatDate(video.released)}</p>
           {/if}
-          {#if video.overview || video.description}
-            <p class="ep-overview">{(video.overview || video.description).slice(0, 150)}…</p>
+            {#if video.overview || video.description}
+            {@const desc = video.overview || video.description}
+            <p class="ep-overview">{desc.length > 150 ? desc.slice(0, 150) + '…' : desc}</p>
           {/if}
         </div>
       </div>
@@ -236,5 +237,17 @@
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
+  }
+
+  /* ── TV-scale ──────────────────────────────── */
+  @media (min-width: 960px) {
+    .season-tab    { padding: 9px 22px; font-size: 0.95rem; }
+    .episode       { padding: 14px 18px; gap: 20px; }
+    .ep-thumb      { width: 190px; min-width: 190px; }
+    .ep-title      { font-size: 1.02rem; }
+    .ep-num        { font-size: 0.82rem; padding: 2px 8px; }
+    .ep-date       { font-size: 0.82rem; }
+    .ep-overview   { font-size: 0.88rem; }
+    .ep-progress   { height: 4px; }
   }
 </style>

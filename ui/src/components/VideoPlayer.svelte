@@ -21,6 +21,14 @@
     rum:'Romanian',  ron:'Romanian',  rus:'Russian',
     spa:'Spanish',   swe:'Swedish',   tha:'Thai',
     tur:'Turkish',   ukr:'Ukrainian', vie:'Vietnamese',
+    bul:'Bulgarian', hrv:'Croatian',  slk:'Slovak',
+    slv:'Slovenian', srp:'Serbian',   mkd:'Macedonian',
+    lit:'Lithuanian',lav:'Latvian',   est:'Estonian',
+    cat:'Catalan',   glg:'Galician',  eus:'Basque',
+    mal:'Malayalam', tam:'Tamil',     tel:'Telugu',
+    ben:'Bengali',   urd:'Urdu',      mar:'Marathi',
+    guj:'Gujarati',  kan:'Kannada',   pan:'Punjabi',
+    msa:'Malay',     tgl:'Tagalog',
     // 2-letter ISO 639-1 fallbacks
     en:'English', ar:'Arabic',  zh:'Chinese', cs:'Czech',
     da:'Danish',  nl:'Dutch',   fi:'Finnish', fr:'French',
@@ -29,7 +37,10 @@
     ko:'Korean',  nb:'Norwegian', no:'Norwegian', fa:'Persian',
     pl:'Polish',  pt:'Portuguese', ro:'Romanian',  ru:'Russian',
     es:'Spanish', sv:'Swedish',   th:'Thai',    tr:'Turkish',
-    uk:'Ukrainian', vi:'Vietnamese',
+    uk:'Ukrainian', vi:'Vietnamese', bg:'Bulgarian', hr:'Croatian',
+    sk:'Slovak',  sl:'Slovenian', sr:'Serbian', mk:'Macedonian',
+    lt:'Lithuanian',lv:'Latvian', et:'Estonian', ca:'Catalan',
+    gl:'Galician', eu:'Basque',  ms:'Malay',   tl:'Tagalog',
   };
 
   function langName(code) {
@@ -73,7 +84,7 @@
 
   // Tracks
   let audioTracks        = [];
-  let currentAudioTrack  = 0;
+  let currentAudioTrack  = -1;
   let hlsSubtitleTracks  = [];
   let currentHlsSubTrack = -1;
   let activeSubTrack     = -1;
@@ -109,13 +120,13 @@
     if (hlsTracks.length) {
       // Group HLS embedded tracks by language
       const byLang = {};
-      hlsTracks.forEach((t, i) => {
+      hlsTracks.forEach((t) => {
         const code = (t.lang || 'und').toLowerCase();
         if (!byLang[code]) byLang[code] = [];
         byLang[code].push({
           lang:   code,
           label:  t.name && t.name !== code ? t.name : langName(code),
-          hlsIdx: i,
+          hlsIdx: t.id,   // use hls.js track .id, not array index
           source: 'hls',
         });
       });
@@ -169,6 +180,7 @@
     errorMsg     = '';
     hlsFailed    = false;
     audioTracks  = [];
+    clearInterval(saveTimer);  // prevent stacking intervals on retry
 
     const isHlsUrl  = url.includes('.m3u8') || url.includes('/master') || url.includes('/hlsv2');
     const useHlsJs  = isHlsUrl && Hls.isSupported();
@@ -197,11 +209,39 @@
     hls = new Hls({
       enableWorker:         true,
       lowLatencyMode:       false,
-      backBufferLength:     60,
+      // Rewrite sub-manifest / segment URLs that stremio-server returns
+      // with absolute paths (missing /ss/ prefix)
+      xhrSetup(xhr, urlStr) {
+        try {
+          const u = new URL(urlStr, window.location.origin);
+          const needs = /^\/[a-f0-9]{40}\//i.test(u.pathname) && !u.pathname.startsWith('/ss/');
+          if (needs) {
+            xhr.open('GET', `${u.origin}/ss${u.pathname}${u.search}`, true);
+          }
+        } catch { /* keep original */ }
+      },
+      // Buffer: keep back-buffer small (TV memory), front-buffer generous
+      backBufferLength:     30,
       maxBufferLength:      60,
       maxMaxBufferLength:   120,
       startLevel:           -1,
-      capLevelToPlayerSize: true,
+      capLevelToPlayerSize: false,
+      // ── Retry settings for stremio-server on-demand transcoding ──
+      fragLoadingMaxRetry:           12,
+      fragLoadingRetryDelay:         1500,
+      fragLoadingMaxRetryTimeout:    45000,
+      manifestLoadingMaxRetry:       6,
+      manifestLoadingRetryDelay:     1500,
+      manifestLoadingMaxRetryTimeout:20000,
+      levelLoadingMaxRetry:          8,
+      levelLoadingRetryDelay:        1500,
+      levelLoadingMaxRetryTimeout:   20000,
+      // ── Stall recovery ──
+      highBufferWatchdogPeriod:      4,
+      nudgeOffset:                   0.3,
+      nudgeMaxRetry:                 10,
+      maxStarvationDelay:            6,
+      maxLoadingDelay:               8,
     });
     hls.loadSource(url);
     hls.attachMedia(videoEl);
@@ -209,29 +249,53 @@
     hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
       audioTracks       = [...(hls.audioTracks      || [])];
       hlsSubtitleTracks = [...(hls.subtitleTracks   || [])];
-      console.log('[hls] audio tracks:', audioTracks.length, audioTracks.map(t => t.name + '/' + t.lang));
-      console.log('[hls] subtitle tracks:', hlsSubtitleTracks.length, hlsSubtitleTracks.map(t => t.name + '/' + t.lang));
+      // Sync currentAudioTrack to what hls.js defaulted to
+      currentAudioTrack = hls.audioTrack;
+      console.log('[hls] manifest parsed. Audio:', audioTracks.length,
+        audioTracks.map(t => `id=${t.id} ${t.name}/${t.lang}`));
+      console.log('[hls] Subtitle:', hlsSubtitleTracks.length,
+        hlsSubtitleTracks.map(t => `id=${t.id} ${t.name}/${t.lang}`));
       applyPreferredAudio();
       videoEl.play().catch(() => {});
     });
 
-    hls.on(Hls.Events.AUDIO_TRACKS_UPDATED,    () => { audioTracks       = [...(hls.audioTracks      || [])]; });
-    hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, () => { hlsSubtitleTracks = [...(hls.subtitleTracks   || [])]; });
-    hls.on(Hls.Events.AUDIO_TRACK_SWITCHED,    (_, d) => { currentAudioTrack = d.id; });
+    // Track list updates (may fire after MANIFEST_PARSED for late-arriving tracks)
+    hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, () => {
+      audioTracks = [...(hls.audioTracks || [])];
+      if (currentAudioTrack < 0) currentAudioTrack = hls.audioTrack;
+    });
+    hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, () => {
+      hlsSubtitleTracks = [...(hls.subtitleTracks || [])];
+    });
+
+    // Sync when hls.js actually switches audio
+    hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_, d) => {
+      currentAudioTrack = d.id;
+      console.log('[hls] Audio switched to track id:', d.id);
+    });
 
     hls.on(Hls.Events.ERROR, (_, data) => {
+      console.warn('[hls] Error:', data.type, data.details, data.fatal);
       if (!data.fatal) return;
-      console.error('[hls.js] Fatal:', data);
+      console.error('[hls] Fatal error:', data);
       const fallback = normalizePlayableUrl(directUrl);
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-        if (fallback && fallback !== url) {
-          cleanupHls(); videoEl.src = fallback; videoEl.load(); videoEl.play().catch(() => {});
-        } else { errorMsg = 'Network error — stream may still be loading.'; }
+        // Try recovery first, then fallback after delay
+        hls.startLoad();
+        setTimeout(() => {
+          if (!videoEl) return;  // component destroyed
+          if (buffering || !playing) {
+            if (fallback && fallback !== url) {
+              cleanupHls(); videoEl.src = fallback; videoEl.load(); videoEl.play().catch(() => {});
+            } else { errorMsg = 'Network error — stream may still be loading. Try again in a moment.'; }
+          }
+        }, 5000);
+        return;
       } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
         hls.recoverMediaError();
       } else {
         hlsFailed = true;
-        if (fallback && fallback !== url) {
+        if (fallback && fallback !== url && videoEl) {
           cleanupHls(); videoEl.src = fallback; videoEl.load(); videoEl.play().catch(() => {});
         } else { errorMsg = 'Playback error — format may be incompatible with your browser.'; }
       }
@@ -244,12 +308,18 @@
 
   function applyPreferredAudio() {
     if (!hls || !audioTracks.length) return;
-    const pref = $prefs.audioLanguage || 'eng';
-    const idx  = audioTracks.findIndex(t =>
-      t.lang?.toLowerCase().includes(pref.toLowerCase()) ||
-      t.name?.toLowerCase().includes(pref.toLowerCase())
+    const pref = ($prefs.audioLanguage || 'eng').toLowerCase();
+    const found = audioTracks.find(t =>
+      t.lang?.toLowerCase() === pref ||
+      t.lang?.toLowerCase().startsWith(pref.slice(0,2)) ||
+      t.name?.toLowerCase().includes(pref)
     );
-    if (idx >= 0) { hls.audioTrack = idx; currentAudioTrack = idx; }
+    if (found != null) {
+      hls.audioTrack = found.id;
+      currentAudioTrack = found.id;
+    } else {
+      currentAudioTrack = hls.audioTrack;
+    }
   }
 
   // ── Video events ──────────────────────────────────────────────────────────
@@ -283,6 +353,7 @@
   }
 
   function onError() {
+    if (!videoEl) return;
     const fallback = normalizePlayableUrl(directUrl);
     if (!hlsFailed && fallback && videoEl.src !== fallback) {
       cleanupHls();
@@ -367,17 +438,19 @@
   }
 
   // ── Track selection ───────────────────────────────────────────────────────
-  function setAudioTrack(idx) {
+  function setAudioTrack(trackId) {
     if (hls) {
-      hls.audioTrack    = idx;
-      currentAudioTrack = idx;
+      hls.audioTrack    = trackId;
+      currentAudioTrack = trackId;
+      console.log('[player] Switching audio to track id:', trackId);
     } else if (videoEl?.audioTracks) {
+      // Native <video> audio tracks — id is the array index
       for (let i = 0; i < videoEl.audioTracks.length; i++) {
-        videoEl.audioTracks[i].enabled = (i === idx);
+        videoEl.audioTracks[i].enabled = (i === trackId);
       }
-      currentAudioTrack = idx;
+      currentAudioTrack = trackId;
     }
-    activePanel = '';
+    // Keep panel open so user sees the selection change
     resetControlTimer();
   }
 
@@ -404,7 +477,7 @@
       });
       activeSubTrack = subtitleTracks.findIndex(s => s.url === track.url);
     }
-    activePanel = '';
+    // Keep panel open so user sees the selection change
     resetControlTimer();
   }
 
@@ -429,14 +502,15 @@
     if (['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return;
     resetControlTimer();
 
-    if (matchKey(e, 'ENTER') || matchKey(e, 'PLAY')) { e.preventDefault(); togglePlay(); return; }
-    if (matchKey(e, 'FF'))   { e.preventDefault(); seekRelative(30);  return; }
-    if (matchKey(e, 'RW'))   { e.preventDefault(); seekRelative(-30); return; }
-    if (matchKey(e, 'RIGHT') && !activePanel) { e.preventDefault(); seekRelative(10);  return; }
-    if (matchKey(e, 'LEFT')  && !activePanel) { e.preventDefault(); seekRelative(-10); return; }
-    if (matchKey(e, 'UP'))   { e.preventDefault(); setVolume(volume + 0.1); return; }
-    if (matchKey(e, 'DOWN')) { e.preventDefault(); setVolume(volume - 0.1); return; }
+    if (matchKey(e, 'ENTER') || matchKey(e, 'PLAY')) { e.preventDefault(); e.stopImmediatePropagation(); togglePlay(); return; }
+    if (matchKey(e, 'FF'))   { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(30);  return; }
+    if (matchKey(e, 'RW'))   { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(-30); return; }
+    if (matchKey(e, 'RIGHT') && !activePanel) { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(10);  return; }
+    if (matchKey(e, 'LEFT')  && !activePanel) { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(-10); return; }
+    if (matchKey(e, 'UP'))   { e.preventDefault(); e.stopImmediatePropagation(); setVolume(volume + 0.1); return; }
+    if (matchKey(e, 'DOWN')) { e.preventDefault(); e.stopImmediatePropagation(); setVolume(volume - 0.1); return; }
     if (matchKey(e, 'BACK')) {
+      e.stopImmediatePropagation();
       if (activePanel) { activePanel = ''; e.preventDefault(); return; }
       e.preventDefault(); dispatch('back'); return;
     }
@@ -527,7 +601,7 @@
     <!-- Top bar -->
     <div class="top-bar">
       <button class="icon-btn back-pill" data-focusable="true" on:click={() => dispatch('back')} title="Back">
-        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
           <polyline points="15 18 9 12 15 6"/>
         </svg>
         <span class="back-lbl">Back</span>
@@ -543,7 +617,7 @@
             on:click|stopPropagation={() => togglePanel('audio')}
             title="Audio track"
           >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
             </svg>
           </button>
@@ -556,7 +630,7 @@
             on:click|stopPropagation={() => togglePanel('subs')}
             title="Subtitles / CC"
           >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="2" y="7" width="20" height="15" rx="2"/><path d="M17 12H7M12 17H7"/>
             </svg>
           </button>
@@ -568,11 +642,11 @@
           title={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
         >
           {#if fullscreen}
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/>
             </svg>
           {:else}
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
             </svg>
           {/if}
@@ -619,37 +693,37 @@
       <div class="btn-row">
         <div class="btn-grp">
           <!-- -30s -->
-          <button class="icon-btn" data-focusable="true"
+          <button class="icon-btn skip-btn" data-focusable="true"
             on:click|stopPropagation={() => seekRelative(-30)} title="-30s">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M11 17a6 6 0 1 1 0-10.66"/>
               <path d="M11 17V7l-4 4"/>
-              <text x="13" y="16.5" font-size="4.5" fill="currentColor" stroke="none" text-anchor="start">30</text>
             </svg>
+            <span class="skip-lbl">30</span>
           </button>
 
           <!-- Play / Pause -->
           <button class="icon-btn play-btn" data-focusable="true"
             on:click|stopPropagation={togglePlay} title={playing ? 'Pause' : 'Play'}>
             {#if playing}
-              <svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor">
+              <svg viewBox="0 0 24 24" fill="currentColor">
                 <rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>
               </svg>
             {:else}
-              <svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor">
+              <svg viewBox="0 0 24 24" fill="currentColor">
                 <polygon points="5 3 19 12 5 21"/>
               </svg>
             {/if}
           </button>
 
           <!-- +30s -->
-          <button class="icon-btn" data-focusable="true"
+          <button class="icon-btn skip-btn" data-focusable="true"
             on:click|stopPropagation={() => seekRelative(30)} title="+30s">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M13 17a6 6 0 1 0 0-10.66"/>
               <path d="M13 17V7l4 4"/>
-              <text x="11" y="16.5" font-size="4.5" fill="currentColor" stroke="none" text-anchor="end">30</text>
             </svg>
+            <span class="skip-lbl">30</span>
           </button>
 
           <!-- Volume -->
@@ -657,17 +731,17 @@
             <button class="icon-btn" data-focusable="true"
               on:click={toggleMute} title={muted ? 'Unmute' : 'Mute'}>
               {#if muted || volume === 0}
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
                   <line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>
                 </svg>
               {:else if volume < 0.5}
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
                   <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
                 </svg>
               {:else}
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
                   <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
                 </svg>
@@ -690,7 +764,7 @@
               on:click|stopPropagation={() => dispatch('next')}
             >
               Next episode
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                 <polyline points="9 18 15 12 9 6"/>
               </svg>
             </button>
@@ -712,19 +786,19 @@
       <div class="ph">
         <span class="ph-title">
           {#if activePanel === 'audio'}
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
             </svg>
             Audio
           {:else}
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="2" y="7" width="20" height="15" rx="2"/><path d="M17 12H7M12 17H7"/>
             </svg>
             Subtitles
           {/if}
         </span>
-        <button class="icon-btn" on:click={() => activePanel = ''} title="Close">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <button class="icon-btn close-btn" on:click={() => activePanel = ''} title="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
             <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
           </svg>
         </button>
@@ -732,19 +806,19 @@
 
       <div class="pb">
         {#if activePanel === 'audio'}
-          {#each audioTracks as track, i}
+          {#each audioTracks as track}
             <button
-              class="pi" class:active={i === currentAudioTrack}
-              data-focusable="true" on:click={() => setAudioTrack(i)}
+              class="pi" class:active={track.id === currentAudioTrack}
+              data-focusable="true" on:click={() => setAudioTrack(track.id)}
             >
               <span class="pi-check">
-                {#if i === currentAudioTrack}
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                {#if track.id === currentAudioTrack}
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                     <polyline points="20 6 9 17 4 12"/>
                   </svg>
                 {/if}
               </span>
-              <span class="pi-lbl">{langName(track.lang) || track.name || track.id || `Track ${i + 1}`}</span>
+              <span class="pi-lbl">{langName(track.lang) || track.name || `Track ${track.id + 1}`}</span>
               {#if track.lang}<span class="pi-tag">{track.lang.toUpperCase()}</span>{/if}
             </button>
           {/each}
@@ -758,7 +832,7 @@
           >
             <span class="pi-check">
               {#if !isSubActive}
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                   <polyline points="20 6 9 17 4 12"/>
                 </svg>
               {/if}
@@ -780,7 +854,7 @@
               >
                 <span class="pi-check">
                   {#if isActive}
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                       <polyline points="20 6 9 17 4 12"/>
                     </svg>
                   {/if}
@@ -822,13 +896,13 @@
     position: absolute; inset: 0;
     display: flex; flex-direction: column;
     align-items: center; justify-content: center;
-    gap: 16px;
+    gap: 18px;
     z-index: 20;
     pointer-events: none;
   }
 
   .buffer-ring {
-    width: 52px; height: 52px;
+    width: 56px; height: 56px;
     border: 3px solid rgba(255,255,255,0.15);
     border-top-color: rgba(255,255,255,0.9);
     border-radius: 50%;
@@ -836,16 +910,16 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  .error-bg { pointer-events: all; background: rgba(0,0,0,0.72); gap: 20px; }
-  .err-icon { width: 52px; height: 52px; color: rgba(255,90,90,0.85); }
+  .error-bg { pointer-events: all; background: rgba(0,0,0,0.78); gap: 22px; }
+  .err-icon { width: 56px; height: 56px; color: rgba(255,90,90,0.85); }
   .err-txt {
-    color: rgba(255,255,255,0.72); font-size: 0.92rem; line-height: 1.55;
-    max-width: 380px; text-align: center;
+    color: rgba(255,255,255,0.72); font-size: 1rem; line-height: 1.55;
+    max-width: 440px; text-align: center;
   }
   .err-retry {
-    padding: 10px 28px; border-radius: 6px;
+    padding: 12px 32px; border-radius: 8px;
     background: var(--accent, #7c3aed); color: #fff;
-    font-weight: 600; font-size: 0.9rem; cursor: pointer;
+    font-weight: 600; font-size: 1rem; cursor: pointer;
   }
   .err-retry:hover { background: var(--accent-light, #8b5cf6); }
 
@@ -853,7 +927,7 @@
   .feedback {
     position: absolute; top: 50%; left: 50%;
     transform: translate(-50%, -50%);
-    width: 74px; height: 74px;
+    width: 80px; height: 80px;
     background: rgba(0,0,0,0.52);
     backdrop-filter: blur(6px);
     border-radius: 50%;
@@ -861,7 +935,7 @@
     pointer-events: none; z-index: 35;
     animation: fbPop 0.7s ease forwards;
   }
-  .feedback svg { width: 34px; height: 34px; }
+  .feedback svg { width: 36px; height: 36px; }
   @keyframes fbPop {
     0%   { opacity: 0; transform: translate(-50%,-50%) scale(0.65); }
     20%  { opacity: 1; transform: translate(-50%,-50%) scale(1.06); }
@@ -880,72 +954,73 @@
   .controls.visible { opacity: 1; pointer-events: all; }
 
   .grad-top {
-    position: absolute; top: 0; left: 0; right: 0; height: 180px;
-    background: linear-gradient(to bottom, rgba(0,0,0,0.82) 0%, transparent 100%);
+    position: absolute; top: 0; left: 0; right: 0; height: 200px;
+    background: linear-gradient(to bottom, rgba(0,0,0,0.85) 0%, transparent 100%);
     pointer-events: none;
   }
   .grad-bottom {
-    position: absolute; bottom: 0; left: 0; right: 0; height: 220px;
-    background: linear-gradient(to top, rgba(0,0,0,0.9) 0%, transparent 100%);
+    position: absolute; bottom: 0; left: 0; right: 0; height: 240px;
+    background: linear-gradient(to top, rgba(0,0,0,0.92) 0%, transparent 100%);
     pointer-events: none;
   }
 
   /* ── Top bar ─────────────────────────────────────────────────────────────── */
   .top-bar {
     position: relative; z-index: 1;
-    display: flex; align-items: center; gap: 10px;
-    padding: 18px 22px 14px;
+    display: flex; align-items: center; gap: 12px;
+    padding: 20px 28px 16px;
     pointer-events: all;
   }
 
   .back-pill {
-    display: flex; align-items: center; gap: 5px;
-    padding: 7px 14px 7px 10px;
+    display: flex; align-items: center; gap: 6px;
+    padding: 9px 18px 9px 12px;
     background: rgba(255,255,255,0.1);
-    border-radius: 20px;
-    font-size: 0.83rem; font-weight: 500;
+    border-radius: 24px;
+    font-size: 0.95rem; font-weight: 500;
     flex-shrink: 0;
-    color: rgba(255,255,255,0.85);
+    color: rgba(255,255,255,0.88);
   }
+  .back-pill svg { width: 18px; height: 18px; }
   .back-lbl { color: inherit; }
 
   .top-title {
     flex: 1; margin: 0;
-    font-size: 0.92rem; font-weight: 600;
-    color: rgba(255,255,255,0.88);
+    font-size: 1.05rem; font-weight: 600;
+    color: rgba(255,255,255,0.9);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     text-align: center;
   }
 
-  .top-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+  .top-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 
   /* ── Bottom bar ──────────────────────────────────────────────────────────── */
   .bottom-bar {
     position: relative; z-index: 1;
-    display: flex; flex-direction: column; gap: 8px;
-    padding: 14px 22px 26px;
+    display: flex; flex-direction: column; gap: 10px;
+    padding: 16px 28px 30px;
     pointer-events: all;
   }
 
   /* Seek row */
   .seek-row {
-    display: flex; align-items: center; gap: 12px;
+    display: flex; align-items: center; gap: 14px;
   }
   .t-lbl {
-    font-size: 0.78rem; font-variant-numeric: tabular-nums;
-    color: rgba(255,255,255,0.65); white-space: nowrap;
-    min-width: 42px; flex-shrink: 0;
+    font-size: 0.9rem; font-variant-numeric: tabular-nums;
+    color: rgba(255,255,255,0.7); white-space: nowrap;
+    min-width: 50px; flex-shrink: 0;
   }
   .t-lbl.right { text-align: right; }
 
   .seek-track {
     position: relative; flex: 1;
-    height: 4px; border-radius: 4px;
+    height: 5px; border-radius: 4px;
     background: rgba(255,255,255,0.2);
     cursor: pointer;
     transition: height 0.14s;
   }
-  .seek-row:hover .seek-track { height: 6px; }
+  .seek-row:hover .seek-track { height: 8px; }
 
   .seek-fill {
     position: absolute; top: 0; left: 0; bottom: 0;
@@ -955,14 +1030,14 @@
   }
   .seek-ghost {
     position: absolute; top: 0; left: 0; bottom: 0;
-    background: rgba(255,255,255,0.32);
+    background: rgba(255,255,255,0.3);
     border-radius: 4px; pointer-events: none;
   }
   .seek-knob {
     position: absolute; top: 50%;
-    width: 14px; height: 14px;
+    width: 16px; height: 16px;
     background: #fff; border-radius: 50%;
-    transform: translate(-50%, -50%) scale(0);
+    transform: translate(-50%, -50%) scale(0.75);
     pointer-events: none;
     transition: transform 0.14s;
     box-shadow: 0 1px 5px rgba(0,0,0,0.5);
@@ -970,16 +1045,16 @@
   .seek-row:hover .seek-knob { transform: translate(-50%, -50%) scale(1); }
 
   .seek-tip {
-    position: absolute; bottom: 18px;
+    position: absolute; bottom: 22px;
     background: rgba(8,8,18,0.95); color: #fff;
-    font-size: 0.73rem; font-variant-numeric: tabular-nums;
-    padding: 3px 8px; border-radius: 4px;
+    font-size: 0.8rem; font-variant-numeric: tabular-nums;
+    padding: 4px 10px; border-radius: 5px;
     pointer-events: none; white-space: nowrap;
   }
 
   .seek-input {
-    position: absolute; inset: -10px 0;
-    width: 100%; height: calc(100% + 20px);
+    position: absolute; inset: -12px 0;
+    width: 100%; height: calc(100% + 24px);
     opacity: 0; cursor: pointer; margin: 0;
     -webkit-appearance: none;
   }
@@ -988,47 +1063,67 @@
   .btn-row {
     display: flex; align-items: center; justify-content: space-between;
   }
-  .btn-grp { display: flex; align-items: center; gap: 2px; }
+  .btn-grp { display: flex; align-items: center; gap: 4px; }
   .btn-grp.right { margin-left: auto; }
+
+  /* SVG icon sizing — controls scale via the container, not inline attrs */
+  .icon-btn svg       { width: 22px; height: 22px; }
+  .play-btn svg       { width: 28px; height: 28px; }
+  .close-btn svg      { width: 18px; height: 18px; }
+  .ph-title svg       { width: 16px; height: 16px; }
+  .pi-check svg       { width: 14px; height: 14px; }
+  .next-btn svg       { width: 14px; height: 14px; }
 
   /* Generic icon button */
   .icon-btn {
     display: flex; align-items: center; justify-content: center;
-    padding: 9px; border-radius: 8px;
-    color: rgba(255,255,255,0.75);
+    padding: 11px; border-radius: 8px;
+    color: rgba(255,255,255,0.8);
     transition: color 0.13s, background 0.13s;
     cursor: pointer;
   }
   .icon-btn:hover, .icon-btn:focus-visible {
-    color: #fff; background: rgba(255,255,255,0.1); outline: none;
+    color: #fff; background: rgba(255,255,255,0.12); outline: none;
+  }
+  .icon-btn:focus-visible {
+    outline: 2px solid rgba(139,92,246,0.75); outline-offset: 2px;
   }
   .icon-btn.active { color: var(--accent-light, #8b5cf6); }
   .icon-btn.active:hover { background: rgba(139,92,246,0.15); }
 
   .play-btn {
-    width: 52px; height: 52px; border-radius: 50%;
+    width: 62px; height: 62px; border-radius: 50%;
     background: rgba(255,255,255,0.12); padding: 0; color: #fff;
   }
   .play-btn:hover { background: var(--accent, #7c3aed); color: #fff; }
 
+  /* Skip button: icon + text label */
+  .skip-btn { position: relative; }
+  .skip-lbl {
+    position: absolute; bottom: 2px; right: 4px;
+    font-size: 0.55rem; font-weight: 700;
+    color: rgba(255,255,255,0.6);
+    pointer-events: none;
+  }
+
   /* Volume */
   .vol-wrap { display: flex; align-items: center; }
   .vol-slider {
-    width: 90px; height: 4px;
+    width: 110px; height: 4px;
     accent-color: var(--accent-light, #8b5cf6);
     cursor: pointer; border-radius: 2px;
-    margin: 0 4px;
+    margin: 0 6px;
   }
 
   /* Next episode */
   .next-btn {
-    display: flex; align-items: center; gap: 6px;
-    padding: 8px 16px;
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 20px;
     background: rgba(255,255,255,0.08);
     border: 1px solid rgba(255,255,255,0.18);
     border-radius: 8px;
-    font-size: 0.83rem; font-weight: 500;
-    color: rgba(255,255,255,0.82);
+    font-size: 0.9rem; font-weight: 500;
+    color: rgba(255,255,255,0.85);
   }
   .next-btn:hover { background: var(--accent, #7c3aed); border-color: transparent; color: #fff; }
 
@@ -1039,13 +1134,13 @@
 
   .side-panel {
     position: absolute; top: 0; right: 0; bottom: 0;
-    width: 290px; max-width: 92vw;
+    width: 320px; max-width: 92vw;
     background: rgba(8, 8, 16, 0.97);
     backdrop-filter: blur(22px);
     border-left: 1px solid rgba(255,255,255,0.07);
     z-index: 50;
     display: flex; flex-direction: column;
-    animation: slideIn 0.2s ease;
+    animation: slideIn 0.22s ease;
   }
   @keyframes slideIn {
     from { transform: translateX(40px); opacity: 0; }
@@ -1055,20 +1150,20 @@
   /* Panel header */
   .ph {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 16px 14px 12px;
+    padding: 18px 16px 14px;
     border-bottom: 1px solid rgba(255,255,255,0.06);
     flex-shrink: 0;
   }
   .ph-title {
-    display: flex; align-items: center; gap: 7px;
-    font-size: 0.78rem; font-weight: 700;
+    display: flex; align-items: center; gap: 8px;
+    font-size: 0.82rem; font-weight: 700;
     color: rgba(255,255,255,0.6);
     text-transform: uppercase; letter-spacing: 0.8px;
   }
 
   /* Panel body */
   .pb {
-    flex: 1; overflow-y: auto; padding: 6px;
+    flex: 1; overflow-y: auto; padding: 8px;
   }
   .pb::-webkit-scrollbar { width: 3px; }
   .pb::-webkit-scrollbar-track { background: transparent; }
@@ -1077,48 +1172,96 @@
   }
 
   .ps-label {
-    font-size: 0.67rem; text-transform: uppercase; letter-spacing: 1.1px;
-    color: rgba(255,255,255,0.28); padding: 14px 8px 5px;
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 1.1px;
+    color: rgba(255,255,255,0.3); padding: 16px 10px 6px;
     font-weight: 700;
   }
 
   /* Panel item */
   .pi {
-    display: flex; align-items: center; gap: 8px;
-    width: 100%; padding: 9px 8px;
-    border-radius: 6px; text-align: left;
-    color: rgba(255,255,255,0.6); font-size: 0.87rem;
+    display: flex; align-items: center; gap: 10px;
+    width: 100%; padding: 12px 10px;
+    border-radius: 8px; text-align: left;
+    color: rgba(255,255,255,0.65); font-size: 0.95rem;
     transition: background 0.1s, color 0.1s; cursor: pointer;
   }
   .pi:hover, .pi:focus-visible {
-    background: rgba(255,255,255,0.07); color: #fff; outline: none;
+    background: rgba(255,255,255,0.09); color: #fff; outline: none;
+  }
+  .pi:focus-visible {
+    outline: 2px solid rgba(139,92,246,0.7); outline-offset: -2px;
   }
   .pi.active { color: var(--accent-light, #8b5cf6); }
   .pi.active:hover { background: rgba(139,92,246,0.1); }
 
   .pi-check {
-    width: 18px; height: 18px;
+    width: 20px; height: 20px;
     display: flex; align-items: center; justify-content: center;
     flex-shrink: 0; color: var(--accent-light, #8b5cf6);
   }
   .pi-lbl { flex: 1; }
   .pi-tag {
-    font-size: 0.66rem; font-weight: 700; letter-spacing: 0.4px;
+    font-size: 0.68rem; font-weight: 700; letter-spacing: 0.4px;
     background: rgba(255,255,255,0.07); color: rgba(255,255,255,0.38);
-    padding: 2px 5px; border-radius: 3px; flex-shrink: 0;
+    padding: 2px 6px; border-radius: 4px; flex-shrink: 0;
   }
   .p-empty {
-    padding: 24px 10px; text-align: center;
-    color: rgba(255,255,255,0.28); font-size: 0.83rem;
+    padding: 28px 12px; text-align: center;
+    color: rgba(255,255,255,0.28); font-size: 0.9rem;
   }
 
-  /* ── Responsive ──────────────────────────────────────────────────────────── */
+  /* ── TV-scale (HD 960px+) ─────────────────────────────────────────────── */
+  @media (min-width: 960px) {
+    .top-bar         { padding: 24px 36px 18px; gap: 16px; }
+    .bottom-bar      { padding: 18px 36px 36px; gap: 12px; }
+    .seek-row        { gap: 18px; }
+    .t-lbl           { font-size: 1rem; min-width: 60px; }
+    .seek-track      { height: 6px; }
+    .seek-row:hover .seek-track { height: 10px; }
+    .seek-knob       { width: 20px; height: 20px; }
+    .seek-tip        { font-size: 0.88rem; padding: 5px 12px; bottom: 26px; }
+
+    .icon-btn        { padding: 14px; }
+    .icon-btn svg    { width: 26px; height: 26px; }
+    .play-btn        { width: 72px; height: 72px; }
+    .play-btn svg    { width: 34px; height: 34px; }
+    .skip-lbl        { font-size: 0.62rem; }
+
+    .vol-slider      { width: 130px; }
+    .top-title       { font-size: 1.15rem; }
+    .back-pill       { font-size: 1rem; padding: 10px 20px 10px 14px; }
+    .back-pill svg   { width: 20px; height: 20px; }
+    .next-btn        { font-size: 0.95rem; padding: 11px 22px; }
+    .next-btn svg    { width: 16px; height: 16px; }
+    .btn-grp         { gap: 6px; }
+
+    .side-panel      { width: 380px; }
+    .ph              { padding: 20px 18px 16px; }
+    .ph-title        { font-size: 0.88rem; }
+    .ph-title svg    { width: 18px; height: 18px; }
+    .pb              { padding: 10px; }
+    .pi              { padding: 14px 12px; font-size: 1.05rem; gap: 12px; }
+    .pi-check        { width: 22px; height: 22px; }
+    .pi-check svg    { width: 16px; height: 16px; }
+    .ps-label        { font-size: 0.78rem; padding: 20px 12px 8px; }
+    .pi-tag          { font-size: 0.72rem; padding: 3px 7px; }
+
+    .feedback        { width: 90px; height: 90px; }
+    .feedback svg    { width: 40px; height: 40px; }
+    .buffer-ring     { width: 60px; height: 60px; }
+    .err-txt         { font-size: 1.1rem; max-width: 500px; }
+    .err-retry       { padding: 14px 36px; font-size: 1.05rem; }
+  }
+
+  /* ── Small screens ──────────────────────────────────────────────────────── */
   @media (max-width: 600px) {
-    .top-bar, .bottom-bar { padding-left: 12px; padding-right: 12px; }
+    .top-bar, .bottom-bar { padding-left: 14px; padding-right: 14px; }
     .side-panel { width: 100%; max-width: 100%; border-left: none; }
-    .vol-slider { width: 60px; }
+    .vol-slider { width: 70px; }
     .back-lbl   { display: none; }
-    .top-title  { font-size: 0.78rem; }
-    .play-btn   { width: 46px; height: 46px; }
+    .top-title  { font-size: 0.82rem; }
+    .play-btn   { width: 50px; height: 50px; }
+    .play-btn svg { width: 24px; height: 24px; }
+    .icon-btn svg { width: 20px; height: 20px; }
   }
 </style>
