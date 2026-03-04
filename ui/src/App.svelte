@@ -9,6 +9,7 @@
   import Player     from './routes/Player.svelte';
   import Search     from './routes/Search.svelte';
   import Library    from './routes/Library.svelte';
+  import Downloads  from './routes/Downloads.svelte';
   import Settings   from './routes/Settings.svelte';
 
   import NavBar from './components/NavBar.svelte';
@@ -20,6 +21,7 @@
     '/':                  Board,
     '/search':            Search,
     '/library':           Library,
+    '/downloads':         Downloads,
     '/meta/:type/:id':    MetaDetails,
     '/player':            Player,
     '/settings':          Settings,

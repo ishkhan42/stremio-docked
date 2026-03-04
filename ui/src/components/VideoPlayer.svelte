@@ -2,8 +2,18 @@
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import Hls from 'hls.js';
   import { recordProgress } from '../stores/progress.js';
+  import { authKey } from '../stores/auth.js';
   import { matchKey, KEYS } from '../lib/keyboard.js';
-  import { subtitleProxyUrl, getMediaInfo, createAudioSwitchUrl } from '../lib/api.js';
+  import {
+    subtitleProxyUrl,
+    getMediaInfo,
+    createAudioSwitchUrl,
+    startStreamPrefetch,
+    stopStreamPrefetch,
+    getStreamPrefetchStatus,
+    startBackgroundDownload,
+    syncRecentlyPlayed,
+  } from '../lib/api.js';
   import { prefs } from '../stores/progress.js';
 
   const dispatch = createEventDispatcher();
@@ -88,6 +98,18 @@
   let switchRollbackTimer;
   let statusHint = '';
   let statusHintTimer;
+  let stallWatchTimer;
+  let lastObservedMediaTime = 0;
+  let stalledTicks = 0;
+  let lastRecoveryAt = 0;
+  let lastProgressAt = 0;
+  let stallHintAt = 0;
+  let prefetchSessionId = '';
+  let prefetchStats = null;
+  let prefetchPollTimer;
+  let backgroundDownloadBusy = false;
+  let lastSyncedAt = 0;
+  let lastSyncedPos = 0;
 
   // Controls visibility
   let showControls   = true;
@@ -151,6 +173,9 @@
     ? (audioSwitchTranscoding ? 'Server audio transcode + video copy' : 'Server remux (no video transcode)')
     : (usingHls ? 'Server transcoding' : 'Direct file playback');
   $: playbackState = errorMsg ? 'Error' : buffering ? 'Buffering' : playing ? 'Playing' : 'Paused';
+  $: prefetchSummary = prefetchStats
+    ? `${formatBytes(prefetchStats.bytesDownloaded)}${prefetchStats.totalBytes > 0 ? ` / ${formatBytes(prefetchStats.totalBytes)}` : ''}`
+    : '';
   $: statusTitle = `Mode: ${playbackMode}\nState: ${playbackState}\nBuffered ahead: ${Math.round(bufferedAhead)}s\nAudio tracks: ${audioTracks.length}`;
 
   /** Grouped subtitle sections: embedded HLS + addon, grouped by language */
@@ -232,15 +257,8 @@
           currentAudioTrack = defIdx >= 0 ? defIdx : 0;
         }
 
-        // Populate embedded subtitle tracks from ffprobe
-        if (info.subtitles?.length && hlsSubtitleTracks.length === 0 && !usingHls) {
-          hlsSubtitleTracks = info.subtitles.map((s, i) => ({
-            id:   i,
-            name: s.title || langName(s.language) || `Subtitle ${i + 1}`,
-            lang: s.language || '',
-            forced: s.forced,
-          }));
-        }
+        // Do NOT populate embedded subtitle list from ffprobe alone.
+        // Only show subtitles that browser actually exposes via videoEl.textTracks.
       }).catch(err => {
         console.warn('[player] Media info fetch failed:', err.message);
         mediaInfoErr = true;
@@ -253,6 +271,10 @@
     document.removeEventListener('fullscreenchange', onFullscreenChange);
     cleanupHls();
     clearInterval(saveTimer);
+    clearInterval(stallWatchTimer);
+    clearInterval(prefetchPollTimer);
+    stopPrefetch();
+    syncPlaybackProgress(true);
     clearTimeout(switchRollbackTimer);
     clearTimeout(controlTimer);
     clearTimeout(feedbackTimer);
@@ -278,6 +300,8 @@
     audioTracks       = [];
     hlsSubtitleTracks = [];
     clearInterval(saveTimer);
+    clearInterval(stallWatchTimer);
+    stopPrefetch();
     cleanupHls();
 
     const isHlsManifest = direct && /\.m3u8($|\?)/i.test(direct);
@@ -311,6 +335,7 @@
     saveTimer = setInterval(() => {
       if (videoEl && !videoEl.paused && duration > 0) {
         recordProgress(type, videoId, currentTime, duration, { name: metaName, poster: metaPoster });
+        syncPlaybackProgress(false);
       }
     }, 5000);
   }
@@ -485,6 +510,7 @@
     hlsFailed = false;
     buffering = false;
     pendingAudioSwitch = null;
+    stopPrefetch();
 
     videoEl.src = direct;
     const resumeAt = resumeTime || currentTime || 0;
@@ -530,7 +556,7 @@
         const native = Array.from(videoEl.textTracks).filter(
           t => (t.kind === 'subtitles' || t.kind === 'captions')
         );
-        if (native.length && !usingHls) {
+        if (!usingHls) {
           hlsSubtitleTracks = native.map((t, i) => ({
             id: i, name: t.label || t.language || `Subtitle ${i + 1}`,
             lang: t.language || '',
@@ -539,6 +565,8 @@
       };
       videoEl.textTracks.addEventListener('addtrack', syncSubs);
       videoEl.textTracks.addEventListener('removetrack', syncSubs);
+      videoEl.textTracks.addEventListener('change', syncSubs);
+      syncSubs();
     }
   }
 
@@ -559,10 +587,272 @@
   }
 
   // ── Video events ──────────────────────────────────────────────────────────
-  function onPlay()    { playing = true;  buffering = false; clearTimeout(switchRollbackTimer); }
-  function onPause()   { playing = false; }
+  function onPlay()    { playing = true;  buffering = false; clearTimeout(switchRollbackTimer); startStallWatchdog(); }
+  function onPause() {
+    playing = false;
+    stopStallWatchdog();
+    syncPlaybackProgress(true);
+  }
   function onWaiting() { buffering = true; }
-  function onPlaying() { buffering = false; playing = true; clearTimeout(switchRollbackTimer); }
+  function onPlaying() {
+    buffering = false;
+    playing = true;
+    clearTimeout(switchRollbackTimer);
+    startStallWatchdog();
+    startPrefetch();
+  }
+
+  function onStalled() {
+    buffering = true;
+    const classification = classifyStall();
+    if (classification === 'decode-gap') {
+      attemptStallRecovery('stalled');
+    } else if (classification === 'network-starvation') {
+      maybeShowStallHint('Buffer underrun detected. Waiting for network/data…');
+      startPrefetch();
+    }
+  }
+
+  function startStallWatchdog() {
+    if (!videoEl) return;
+    clearInterval(stallWatchTimer);
+    stalledTicks = 0;
+    lastObservedMediaTime = videoEl.currentTime || 0;
+    lastProgressAt = Date.now();
+
+    stallWatchTimer = setInterval(() => {
+      if (!videoEl || usingHls || audioSwitchSession) return;
+      if (videoEl.paused || videoEl.seeking || errorMsg) return;
+
+      const mediaTime = videoEl.currentTime || 0;
+      const advanced = Math.abs(mediaTime - lastObservedMediaTime) > 0.08;
+      if (advanced) {
+        lastObservedMediaTime = mediaTime;
+        stalledTicks = 0;
+        return;
+      }
+
+      stalledTicks += 1;
+      if (stalledTicks >= 4) {
+        const classification = classifyStall();
+        if (classification === 'decode-gap') {
+          attemptStallRecovery('watchdog');
+        } else if (classification === 'network-starvation') {
+          maybeShowStallHint('Network starvation detected. Prefetching ahead…');
+          startPrefetch();
+        }
+      }
+    }, 1000);
+  }
+
+  function stopStallWatchdog() {
+    clearInterval(stallWatchTimer);
+    stalledTicks = 0;
+  }
+
+  function classifyStall() {
+    if (!videoEl) return 'unknown';
+    const now = Date.now();
+    const ready = videoEl.readyState;
+    const network = videoEl.networkState;
+    const ahead = bufferedAhead;
+    const recentProgress = (now - lastProgressAt) < 3000;
+
+    // Data available ahead, but playhead doesn't move: likely timestamp/decode issue.
+    if (ahead >= 1.5 && (ready >= 3 || recentProgress)) {
+      return 'decode-gap';
+    }
+
+    // Little/no buffered data and no recent network fill: likely starvation.
+    if (ahead <= 0.4 && (network === 2 || !recentProgress || ready <= 2)) {
+      return 'network-starvation';
+    }
+
+    return 'unknown';
+  }
+
+  function maybeShowStallHint(msg) {
+    const now = Date.now();
+    if (now - stallHintAt < 6000) return;
+    stallHintAt = now;
+    showStatusHint(msg);
+  }
+
+  function attemptStallRecovery(source = 'watchdog') {
+    if (!videoEl || usingHls || audioSwitchSession) return;
+    if (videoEl.paused || videoEl.seeking) return;
+
+    const now = Date.now();
+    if (now - lastRecoveryAt < 4500) return;
+    lastRecoveryAt = now;
+
+    const current = videoEl.currentTime || 0;
+    let target = current + 0.12;
+
+    // If we are exactly at a buffered range end, hop over tiny discontinuity.
+    if (videoEl.buffered?.length > 1) {
+      for (let i = 0; i < videoEl.buffered.length - 1; i++) {
+        const end = videoEl.buffered.end(i);
+        const nextStart = videoEl.buffered.start(i + 1);
+        if (Math.abs(current - end) < 0.12 && nextStart - end < 1.0) {
+          target = Math.max(target, nextStart + 0.04);
+          break;
+        }
+      }
+    }
+
+    if (videoEl.buffered?.length) {
+      for (let i = 0; i < videoEl.buffered.length; i++) {
+        const start = videoEl.buffered.start(i);
+        const end = videoEl.buffered.end(i);
+        if (current >= start && current <= end) {
+          if (end - current < 0.15) {
+            target = Math.max(target, end + 0.05);
+          }
+          break;
+        }
+      }
+    }
+
+    if (Number.isFinite(videoEl.duration) && videoEl.duration > 0) {
+      target = Math.min(videoEl.duration - 0.2, target);
+    }
+
+    if (target > current + 0.01) {
+      videoEl.currentTime = target;
+      buffering = true;
+      showStatusHint(source === 'stalled'
+        ? 'Decode gap detected. Applying tiny timeline nudge…'
+        : 'Likely decode/timestamp stall. Auto-recovering gently…');
+    }
+  }
+
+  async function startPrefetch() {
+    if (!infoHash || usingHls || audioSwitchSession) return;
+    if (prefetchSessionId) {
+      startPrefetchPolling();
+      return;
+    }
+    if (!videoEl || videoEl.paused) return;
+
+    try {
+      const res = await startStreamPrefetch({
+        infoHash,
+        fileIdx,
+        startTimeSec: currentTime || 0,
+        durationSec: duration || 0,
+      });
+      prefetchSessionId = res.sessionId || '';
+      if (prefetchSessionId) {
+        prefetchStats = null;
+        startPrefetchPolling();
+        showStatusHint('Prefetch started: warming stream cache ahead of playback.');
+      }
+    } catch (err) {
+      console.warn('[player] prefetch start failed:', err.message);
+    }
+  }
+
+  function startPrefetchPolling() {
+    clearInterval(prefetchPollTimer);
+    if (!prefetchSessionId) return;
+
+    const tick = async () => {
+      if (!prefetchSessionId) return;
+      try {
+        const stats = await getStreamPrefetchStatus(prefetchSessionId);
+        prefetchStats = stats;
+        if (['done', 'failed', 'stopped'].includes(stats?.status)) {
+          prefetchSessionId = '';
+          clearInterval(prefetchPollTimer);
+        }
+      } catch {
+        prefetchSessionId = '';
+        prefetchStats = null;
+        clearInterval(prefetchPollTimer);
+      }
+    };
+
+    tick();
+    prefetchPollTimer = setInterval(tick, 2000);
+  }
+
+  async function stopPrefetch() {
+    clearInterval(prefetchPollTimer);
+    if (!prefetchSessionId) return;
+    const id = prefetchSessionId;
+    prefetchSessionId = '';
+    prefetchStats = null;
+    try {
+      await stopStreamPrefetch(id);
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+
+  async function triggerBackgroundDownload() {
+    if (!infoHash || backgroundDownloadBusy) return;
+    backgroundDownloadBusy = true;
+    try {
+      await startBackgroundDownload({
+        infoHash,
+        fileIdx,
+        startTimeSec: currentTime || 0,
+        durationSec: duration || 0,
+        title,
+        type,
+        videoId,
+        metaName,
+        metaPoster,
+      });
+      showStatusHint('Background download started. Track progress in Downloads.');
+    } catch (err) {
+      showStatusHint(`Background download failed: ${err.message}`);
+    } finally {
+      backgroundDownloadBusy = false;
+    }
+  }
+
+  async function syncPlaybackProgress(force = false) {
+    if (!$authKey || !videoId || !duration) return;
+    const now = Date.now();
+    if (!force) {
+      if (now - lastSyncedAt < 20000) return;
+      if (Math.abs((currentTime || 0) - lastSyncedPos) < 15) return;
+    }
+
+    try {
+      await syncRecentlyPlayed({
+        authKey: $authKey,
+        type,
+        mediaId: videoId,
+        videoId,
+        name: metaName || title || videoId,
+        poster: metaPoster || '',
+        position: currentTime || 0,
+        duration: duration || 0,
+      });
+      lastSyncedAt = now;
+      lastSyncedPos = currentTime || 0;
+    } catch {
+      // best-effort sync
+    }
+  }
+
+  function formatBytes(bytes) {
+    const value = Number(bytes || 0);
+    if (!Number.isFinite(value) || value <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const idx = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
+    const scaled = value / (1024 ** idx);
+    return `${scaled >= 10 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[idx]}`;
+  }
+
+  function formatRate(bytesPerSec) {
+    const value = Number(bytesPerSec || 0);
+    if (!Number.isFinite(value) || value <= 0) return '0 B/s';
+    return `${formatBytes(value)}/s`;
+  }
 
   function onLoadedMeta() {
     const mediaDuration = videoEl.duration || 0;
@@ -600,6 +890,11 @@
     updateBufferedAhead();
   }
 
+  function onProgress() {
+    lastProgressAt = Date.now();
+    updateBufferedAhead();
+  }
+
   function updateBufferedAhead() {
     if (!videoEl || !videoEl.buffered || !videoEl.buffered.length) {
       bufferedAhead = 0;
@@ -619,7 +914,10 @@
   }
 
   function onEnded() {
+    stopStallWatchdog();
+    stopPrefetch();
     recordProgress(type, videoId, duration, duration, { name: metaName, poster: metaPoster });
+    syncPlaybackProgress(true);
     dispatch('ended');
   }
 
@@ -831,7 +1129,13 @@
         const subs = Array.from(videoEl.textTracks).filter(
           t => t.kind === 'subtitles' || t.kind === 'captions'
         );
-        subs.forEach((t, i) => { t.mode = i === track.hlsIdx ? 'showing' : 'disabled'; });
+        subs.forEach((t, i) => { t.mode = i === track.hlsIdx ? 'hidden' : 'disabled'; });
+        const selected = subs[track.hlsIdx];
+        if (selected) {
+          selected.mode = 'showing';
+        } else {
+          showStatusHint('This subtitle track is not available in direct playback.');
+        }
       }
       currentHlsSubTrack = track.hlsIdx;
       activeSubTrack = -1;
@@ -873,6 +1177,7 @@
     if (['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return;
     resetControlTimer();
 
+    if (e.code === 'Space' || e.key === ' ') { e.preventDefault(); e.stopImmediatePropagation(); togglePlay(); return; }
     if (matchKey(e, 'ENTER') || matchKey(e, 'PLAY')) { e.preventDefault(); e.stopImmediatePropagation(); togglePlay(); return; }
     if (matchKey(e, 'FF'))   { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(30);  return; }
     if (matchKey(e, 'RW'))   { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(-30); return; }
@@ -916,7 +1221,8 @@
     on:playing={onPlaying}
     on:loadedmetadata={onLoadedMeta}
     on:timeupdate={onTimeUpdate}
-    on:progress={updateBufferedAhead}
+    on:progress={onProgress}
+    on:stalled={onStalled}
     on:ended={onEnded}
     on:error={onError}
   ></video>
@@ -965,7 +1271,7 @@
   {/if}
 
   <!-- ───────────── Controls ──────────────────────────────────────────────── -->
-  <div class="controls" class:visible={showControls || !playing || !!errorMsg || !!activePanel} on:click|stopPropagation>
+  <div class="controls" class:visible={showControls || !playing || !!errorMsg || !!activePanel}>
 
     <div class="grad-top"    aria-hidden="true"></div>
     <div class="grad-bottom" aria-hidden="true"></div>
@@ -1017,6 +1323,12 @@
             <p><b>State:</b> {playbackState}</p>
             <p><b>Buffered:</b> {Math.round(bufferedAhead)}s ahead</p>
             <p><b>Source:</b> {playbackSource}</p>
+            {#if prefetchStats}
+              <p><b>Prefetch:</b> {prefetchStats.status || 'running'} · {prefetchSummary}</p>
+              {#if prefetchStats.speedBps}
+                <p><b>Rate:</b> {formatRate(prefetchStats.speedBps)}</p>
+              {/if}
+            {/if}
             {#if statusHint}<p><b>Note:</b> {statusHint}</p>{/if}
           </div>
         </div>
@@ -1143,6 +1455,16 @@
 
         <!-- Right group -->
         <div class="btn-grp right">
+          {#if infoHash}
+            <button
+              class="icon-btn next-btn"
+              data-focusable="true"
+              on:click|stopPropagation={triggerBackgroundDownload}
+              disabled={backgroundDownloadBusy}
+            >
+              {backgroundDownloadBusy ? 'Starting…' : 'Download'}
+            </button>
+          {/if}
           {#if hasNext}
             <button
               class="icon-btn next-btn" data-focusable="true"

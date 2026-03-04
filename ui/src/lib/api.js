@@ -108,6 +108,109 @@ export async function createAudioSwitchUrl({ infoHash, fileIdx = 0, audioTrackIn
     });
 }
 
+/**
+ * Start backend prefetch warming for direct playback.
+ */
+export async function startStreamPrefetch({ infoHash, fileIdx = 0, startTimeSec = 0, durationSec = 0 }) {
+    return call('/stream-prefetch/start', {
+        method: 'POST',
+        body: JSON.stringify({ infoHash, fileIdx, startTimeSec, durationSec }),
+    });
+}
+
+/**
+ * Start backend prefetch in background download mode.
+ */
+export async function startBackgroundDownload({
+    infoHash,
+    fileIdx = 0,
+    startTimeSec = 0,
+    durationSec = 0,
+    title = '',
+    type = '',
+    videoId = '',
+    metaName = '',
+    metaPoster = '',
+}) {
+    return call('/stream-prefetch/start', {
+        method: 'POST',
+        body: JSON.stringify({
+            infoHash,
+            fileIdx,
+            startTimeSec,
+            durationSec,
+            mode: 'download',
+            title,
+            type,
+            videoId,
+            metaName,
+            metaPoster,
+        }),
+    });
+}
+
+/**
+ * Read a running prefetch session status.
+ */
+export async function getStreamPrefetchStatus(sessionId) {
+    return call(`/stream-prefetch/${encodeURIComponent(sessionId)}/status`);
+}
+
+/**
+ * List known downloads.
+ */
+export async function getDownloads() {
+    return call('/stream-prefetch/downloads');
+}
+
+/**
+ * Delete one download and clean local cache.
+ */
+export async function deleteDownload(downloadId) {
+    return call(`/stream-prefetch/downloads/${encodeURIComponent(downloadId)}`, {
+        method: 'DELETE',
+    });
+}
+
+/**
+ * Sync local recent-played progress back to Stremio account.
+ */
+export async function syncRecentlyPlayed({
+    authKey,
+    type,
+    mediaId,
+    videoId,
+    name,
+    poster,
+    background = '',
+    position,
+    duration,
+}) {
+    return call('/recently-played/sync', {
+        method: 'POST',
+        body: JSON.stringify({
+            authKey,
+            type,
+            mediaId,
+            videoId,
+            name,
+            poster,
+            background,
+            position,
+            duration,
+        }),
+    });
+}
+
+/**
+ * Stop a running backend prefetch session.
+ */
+export async function stopStreamPrefetch(sessionId) {
+    return call(`/stream-prefetch/${encodeURIComponent(sessionId)}`, {
+        method: 'DELETE',
+    });
+}
+
 /** Check stremio-server status. */
 export async function serverStatus() {
     return call('/server-status');

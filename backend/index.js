@@ -16,6 +16,7 @@ const https = require('https');
 const http = require('http');
 const { Readable } = require('stream');
 const fs = require('fs/promises');
+const fsSync = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
@@ -46,8 +47,15 @@ const STREMIO_SERVER = process.env.STREMIO_SERVER_URL || 'http://127.0.0.1:11470
 const STREMIO_API = 'https://api.strem.io';
 const AUDIO_SWITCH_ROOT = '/tmp/stremio-audio-switch';
 const AUDIO_SESSION_TTL_MS = 45 * 60 * 1000;
+const PREFETCH_TTL_MS = 20 * 60 * 1000;
+const PREFETCH_MAX_JOBS = 2;
+const DOWNLOAD_INDEX_PATH = '/root/.stremio-server/stremio-docked-downloads.json';
+const STREMIO_CACHE_ROOT = '/root/.stremio-server/stremio-cache';
+const SYNC_MIN_INTERVAL_MS = 15000;
 
 const audioSessions = new Map();
+const prefetchJobs = new Map();
+const recentSyncLastAt = new Map();
 
 function safeSessionPath(sessionId) {
     return path.join(AUDIO_SWITCH_ROOT, sessionId);
@@ -82,9 +90,269 @@ async function cleanupExpiredAudioSessions() {
     await Promise.all(toDrop.map(stopAudioSession));
 }
 
+async function stopPrefetchJob(sessionId) {
+    const job = prefetchJobs.get(sessionId);
+    if (!job) return;
+    prefetchJobs.delete(sessionId);
+    if (job.status === 'running' || job.status === 'starting') {
+        job.status = 'stopped';
+    }
+    if (job.mode === 'download' && job.downloadId) {
+        await updateDownloadRecord(job.downloadId, {
+            sessionId: null,
+            status: job.status,
+            updatedAt: Date.now(),
+        });
+    }
+    try { job.controller?.abort(); } catch { }
+}
+
+async function cleanupExpiredPrefetchJobs() {
+    const now = Date.now();
+    const stale = [];
+    for (const [id, job] of prefetchJobs.entries()) {
+        const expired = now - (job.lastAccess || job.createdAt || 0) > PREFETCH_TTL_MS;
+        const finalized = job.status === 'done' || job.status === 'failed' || job.status === 'stopped';
+        if (expired || (finalized && now - (job.updatedAt || job.lastAccess || 0) > 3 * 60 * 1000)) {
+            stale.push(id);
+        }
+    }
+    await Promise.all(stale.map(stopPrefetchJob));
+}
+
+function readDownloadIndex() {
+    try {
+        if (!fsSync.existsSync(DOWNLOAD_INDEX_PATH)) return [];
+        const raw = fsSync.readFileSync(DOWNLOAD_INDEX_PATH, 'utf-8');
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+async function writeDownloadIndex(entries) {
+    const safeEntries = Array.isArray(entries) ? entries : [];
+    await fs.mkdir(path.dirname(DOWNLOAD_INDEX_PATH), { recursive: true });
+    await fs.writeFile(DOWNLOAD_INDEX_PATH, JSON.stringify(safeEntries, null, 2), 'utf-8');
+}
+
+async function updateDownloadRecord(downloadId, patch = {}) {
+    const now = Date.now();
+    const entries = readDownloadIndex();
+    const idx = entries.findIndex(e => e.id === downloadId);
+    if (idx >= 0) {
+        entries[idx] = {
+            ...entries[idx],
+            ...patch,
+            updatedAt: now,
+        };
+    } else {
+        entries.push({
+            id: downloadId,
+            createdAt: now,
+            updatedAt: now,
+            status: 'queued',
+            ...patch,
+        });
+    }
+    await writeDownloadIndex(entries);
+}
+
+function toDownloadId(infoHash, fileIdx) {
+    return `${infoHash}:${fileIdx}`;
+}
+
+function estimateCachePath(infoHash) {
+    return /^[a-f0-9]{40}$/i.test(infoHash)
+        ? path.join(STREMIO_CACHE_ROOT, infoHash.toLowerCase())
+        : null;
+}
+
+async function removeDownloadArtifacts(infoHash) {
+    const cachePath = estimateCachePath(infoHash);
+    if (!cachePath) return { removedBytes: 0, removedFiles: 0 };
+
+    let removedBytes = 0;
+    let removedFiles = 0;
+    async function walkSize(dirPath) {
+        const entries = await fs.readdir(dirPath, { withFileTypes: true });
+        for (const entry of entries) {
+            const full = path.join(dirPath, entry.name);
+            if (entry.isDirectory()) {
+                await walkSize(full);
+            } else if (entry.isFile()) {
+                const st = await fs.stat(full).catch(() => null);
+                if (st) {
+                    removedBytes += st.size;
+                    removedFiles += 1;
+                }
+            }
+        }
+    }
+
+    const exists = await fs.access(cachePath).then(() => true).catch(() => false);
+    if (!exists) return { removedBytes: 0, removedFiles: 0 };
+
+    await walkSize(cachePath).catch(() => { });
+    await fs.rm(cachePath, { recursive: true, force: true }).catch(() => { });
+    return { removedBytes, removedFiles };
+}
+
 setInterval(() => {
     cleanupExpiredAudioSessions().catch(() => { });
+    cleanupExpiredPrefetchJobs().catch(() => { });
 }, 5 * 60 * 1000).unref();
+
+async function startPrefetchJob({ infoHash, fileIdx, startTimeSec = 0, durationSec = 0, mode = 'prefetch', metadata = {} }) {
+    if (prefetchJobs.size >= PREFETCH_MAX_JOBS) {
+        const oldest = [...prefetchJobs.entries()].sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0))[0];
+        if (oldest) await stopPrefetchJob(oldest[0]);
+    }
+
+    const streamUrl = `${STREMIO_SERVER}/${infoHash}/${fileIdx}`;
+    const sessionId = crypto.randomUUID();
+    const controller = new AbortController();
+    const headers = {};
+
+    let startedAtByte = 0;
+    const start = Math.max(0, Number(startTimeSec) || 0);
+    const total = Math.max(0, Number(durationSec) || 0);
+
+    if (start > 0 && total > 0) {
+        try {
+            const head = await fetch(streamUrl, { method: 'HEAD', signal: AbortSignal.timeout(3000) });
+            const contentLength = Number(head.headers.get('content-length') || '0');
+            if (Number.isFinite(contentLength) && contentLength > 0) {
+                const ratio = Math.min(0.98, Math.max(0, start / total));
+                startedAtByte = Math.floor(contentLength * ratio);
+                headers.Range = `bytes=${startedAtByte}-`;
+            }
+        } catch {
+            // continue without range
+        }
+    }
+
+    const normalizedMode = mode === 'download' ? 'download' : 'prefetch';
+    const downloadId = normalizedMode === 'download' ? toDownloadId(infoHash, fileIdx) : null;
+
+    const job = {
+        id: sessionId,
+        infoHash,
+        fileIdx,
+        mode: normalizedMode,
+        metadata,
+        downloadId,
+        status: 'starting',
+        createdAt: Date.now(),
+        lastAccess: Date.now(),
+        updatedAt: Date.now(),
+        controller,
+        startedAtByte,
+        bytesDownloaded: 0,
+        totalBytes: 0,
+        speedBps: 0,
+        startedAt: Date.now(),
+        lastByteAt: Date.now(),
+    };
+    prefetchJobs.set(sessionId, job);
+
+    if (normalizedMode === 'download' && downloadId) {
+        await updateDownloadRecord(downloadId, {
+            infoHash,
+            fileIdx,
+            title: metadata.title || '',
+            type: metadata.type || '',
+            videoId: metadata.videoId || '',
+            metaName: metadata.metaName || '',
+            metaPoster: metadata.metaPoster || '',
+            status: 'starting',
+            sessionId,
+            cachePath: estimateCachePath(infoHash),
+            bytesDownloaded: 0,
+            totalBytes: 0,
+            speedBps: 0,
+        });
+    }
+
+    (async () => {
+        try {
+            const response = await fetch(streamUrl, { headers, signal: controller.signal });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            job.status = 'running';
+            job.totalBytes = Number(response.headers.get('content-length') || '0') || 0;
+            job.updatedAt = Date.now();
+
+            if (normalizedMode === 'download' && downloadId) {
+                await updateDownloadRecord(downloadId, {
+                    status: 'running',
+                    sessionId,
+                    totalBytes: job.totalBytes,
+                });
+            }
+
+            let lastPersistAt = 0;
+
+            await new Promise((resolve, reject) => {
+                response.body.on('data', (chunk) => {
+                    const size = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk || ''));
+                    const now = Date.now();
+                    const elapsedSec = Math.max(1, (now - job.startedAt) / 1000);
+                    job.bytesDownloaded += size;
+                    job.speedBps = Math.round(job.bytesDownloaded / elapsedSec);
+                    job.lastAccess = Date.now();
+                    job.updatedAt = now;
+                    job.lastByteAt = now;
+
+                    if (normalizedMode === 'download' && downloadId && (now - lastPersistAt > 1200)) {
+                        lastPersistAt = now;
+                        updateDownloadRecord(downloadId, {
+                            status: 'running',
+                            sessionId,
+                            bytesDownloaded: job.bytesDownloaded,
+                            totalBytes: job.totalBytes,
+                            speedBps: job.speedBps,
+                        }).catch(() => { });
+                    }
+                });
+                response.body.on('end', resolve);
+                response.body.on('error', reject);
+            });
+
+            job.status = 'done';
+            job.updatedAt = Date.now();
+            if (normalizedMode === 'download' && downloadId) {
+                await updateDownloadRecord(downloadId, {
+                    sessionId: null,
+                    status: 'done',
+                    bytesDownloaded: job.bytesDownloaded,
+                    totalBytes: job.totalBytes,
+                    speedBps: 0,
+                });
+            }
+        } catch (err) {
+            if (controller.signal.aborted) {
+                job.status = 'stopped';
+            } else {
+                job.status = 'failed';
+                job.error = err.message;
+            }
+            job.updatedAt = Date.now();
+            if (normalizedMode === 'download' && downloadId) {
+                await updateDownloadRecord(downloadId, {
+                    sessionId: null,
+                    status: job.status,
+                    lastError: job.error || '',
+                    bytesDownloaded: job.bytesDownloaded,
+                    totalBytes: job.totalBytes,
+                    speedBps: 0,
+                });
+            }
+        }
+    })();
+
+    return { sessionId, startedAtByte, mode: normalizedMode, downloadId };
+}
 
 async function waitForFile(filePath, timeoutMs = 10000) {
     const startedAt = Date.now();
@@ -597,6 +865,189 @@ app.delete('/audio-switch/:sessionId', async (req, res) => {
     const { sessionId } = req.params;
     await stopAudioSession(sessionId).catch(() => { });
     res.json({ ok: true });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Direct stream prefetch /stream-prefetch/*
+// Warm cache ahead of playback for high bitrate direct streams.
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post('/stream-prefetch/start', async (req, res) => {
+    try {
+        const infoHash = String(req.body?.infoHash || '').toLowerCase();
+        const fileIdx = toNumber(req.body?.fileIdx, 0);
+        const startTimeSec = Math.max(0, toNumber(req.body?.startTimeSec, 0));
+        const durationSec = Math.max(0, toNumber(req.body?.durationSec, 0));
+        const mode = req.body?.mode === 'download' ? 'download' : 'prefetch';
+        const metadata = {
+            title: String(req.body?.title || ''),
+            type: String(req.body?.type || ''),
+            videoId: String(req.body?.videoId || ''),
+            metaName: String(req.body?.metaName || ''),
+            metaPoster: String(req.body?.metaPoster || ''),
+        };
+
+        if (!/^[a-f0-9]{40}$/i.test(infoHash)) {
+            return res.status(400).json({ error: 'Invalid infoHash' });
+        }
+        if (!Number.isInteger(fileIdx) || fileIdx < 0) {
+            return res.status(400).json({ error: 'Invalid fileIdx' });
+        }
+
+        const started = await startPrefetchJob({ infoHash, fileIdx, startTimeSec, durationSec, mode, metadata });
+        return res.json({ ok: true, ...started });
+    } catch (err) {
+        return res.status(500).json({ error: `Prefetch start failed: ${err.message}` });
+    }
+});
+
+app.get('/stream-prefetch/:sessionId/status', async (req, res) => {
+    const { sessionId } = req.params;
+    const job = prefetchJobs.get(sessionId);
+    if (!job) return res.status(404).json({ error: 'Prefetch session not found' });
+
+    job.lastAccess = Date.now();
+    const progress = job.totalBytes > 0
+        ? Math.min(100, (job.bytesDownloaded / job.totalBytes) * 100)
+        : null;
+
+    return res.json({
+        sessionId: job.id,
+        mode: job.mode,
+        status: job.status,
+        infoHash: job.infoHash,
+        fileIdx: job.fileIdx,
+        bytesDownloaded: job.bytesDownloaded,
+        totalBytes: job.totalBytes,
+        speedBps: job.speedBps,
+        startedAtByte: job.startedAtByte,
+        progress,
+        error: job.error || null,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt || job.lastAccess,
+    });
+});
+
+app.get('/stream-prefetch/downloads', async (req, res) => {
+    const entries = readDownloadIndex();
+    const items = entries.map((item) => {
+        const active = item.sessionId ? prefetchJobs.get(item.sessionId) : null;
+        const bytesDownloaded = active ? active.bytesDownloaded : (item.bytesDownloaded || 0);
+        const totalBytes = active ? active.totalBytes : (item.totalBytes || 0);
+        const speedBps = active ? active.speedBps : (item.speedBps || 0);
+        const progress = totalBytes > 0 ? Math.min(100, (bytesDownloaded / totalBytes) * 100) : null;
+        return {
+            ...item,
+            status: active ? active.status : item.status,
+            bytesDownloaded,
+            totalBytes,
+            speedBps,
+            progress,
+            activeSessionId: active?.id || null,
+        };
+    }).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    res.json({ items });
+});
+
+app.delete('/stream-prefetch/downloads/:downloadId', async (req, res) => {
+    const downloadId = String(req.params.downloadId || '');
+    const entries = readDownloadIndex();
+    const current = entries.find(item => item.id === downloadId);
+    if (!current) return res.status(404).json({ error: 'Download not found' });
+
+    if (current.sessionId) {
+        await stopPrefetchJob(current.sessionId).catch(() => { });
+    }
+
+    const cleaned = await removeDownloadArtifacts(current.infoHash).catch(() => ({ removedBytes: 0, removedFiles: 0 }));
+    const next = entries.filter(item => item.id !== downloadId);
+    await writeDownloadIndex(next);
+
+    res.json({
+        ok: true,
+        removedBytes: cleaned.removedBytes || 0,
+        removedFiles: cleaned.removedFiles || 0,
+    });
+});
+
+app.delete('/stream-prefetch/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    await stopPrefetchJob(sessionId).catch(() => { });
+    res.json({ ok: true });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Recently played sync-up /recently-played/sync
+// Best-effort write-back from local playback progress to Stremio account.
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post('/recently-played/sync', async (req, res) => {
+    try {
+        const authKey = String(req.body?.authKey || '');
+        const mediaId = String(req.body?.mediaId || req.body?.videoId || '');
+        const type = String(req.body?.type || 'movie');
+        const name = String(req.body?.name || req.body?.metaName || mediaId || 'Unknown');
+        const poster = String(req.body?.poster || req.body?.metaPoster || '');
+        const background = String(req.body?.background || '');
+        const position = Math.max(0, toNumber(req.body?.position, 0));
+        const duration = Math.max(0, toNumber(req.body?.duration, 0));
+
+        if (!authKey) return res.status(400).json({ error: 'Missing authKey' });
+        if (!mediaId) return res.status(400).json({ error: 'Missing mediaId/videoId' });
+
+        const dedupeKey = `${authKey}:${type}:${mediaId}`;
+        const now = Date.now();
+        const lastAt = recentSyncLastAt.get(dedupeKey) || 0;
+        if (now - lastAt < SYNC_MIN_INTERVAL_MS) {
+            return res.json({ ok: true, skipped: true });
+        }
+        recentSyncLastAt.set(dedupeKey, now);
+
+        const state = {
+            timeOffset: Math.floor(position),
+            duration: Math.floor(duration),
+            lastWatched: new Date(now).toISOString(),
+        };
+
+        const itemId = mediaId.includes(':') ? mediaId : `${type}:${mediaId}`;
+        const item = {
+            _id: itemId,
+            type,
+            name,
+            poster,
+            background,
+            state,
+            mtime: now,
+        };
+
+        const payloads = [
+            { type: 'DatastorePut', authKey, collection: 'libraryItem', key: itemId, value: item },
+            { type: 'DatastorePut', authKey, collection: 'libraryItem', item },
+            { type: 'DatastorePut', authKey, collection: 'libraryItem', changes: [item] },
+        ];
+
+        let synced = false;
+        let lastError = null;
+        for (const payload of payloads) {
+            try {
+                const response = await stremioApiCall('/api/datastorePut', payload);
+                if (response?.result || response?.ok || response === true) {
+                    synced = true;
+                    break;
+                }
+            } catch (err) {
+                lastError = err;
+            }
+        }
+
+        if (!synced) {
+            return res.status(502).json({ error: `Stremio sync failed: ${lastError?.message || 'unknown error'}` });
+        }
+
+        return res.json({ ok: true, id: itemId });
+    } catch (err) {
+        return res.status(500).json({ error: `Sync failed: ${err.message}` });
+    }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
