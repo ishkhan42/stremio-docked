@@ -17,6 +17,7 @@
 - Stream URL normalization logic lives in `backend/utils.js` (`normalizeStreamUrl`, `extractHashFileFromPath`). Reuse these before adding new URL rules.
 
 ## Developer workflows
+- Local npm/nodejs commands are not allowed. Use Docker for all local build/test/development to ensure environment parity.
 - Full stack (recommended): `docker compose up -d --build` from repo root.
 - UI local dev: `cd ui && npm install && npm run dev` (Vite proxies `/api`→`3001`, `/ss`→`11470` in `ui/vite.config.js`).
 - Backend local dev: `cd backend && npm install && npm run dev`.
