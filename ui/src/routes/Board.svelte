@@ -1,6 +1,5 @@
 <script>
   import { onMount } from 'svelte';
-  import { push }    from 'svelte-spa-router';
   import { addons, catalogRows, loadAddons } from '../stores/addons.js';
   import { authKey }  from '../stores/auth.js';
   import { getContinueItems } from '../stores/progress.js';
@@ -37,13 +36,24 @@
       syncedItems = [];
     }
 
-    const localItems = getContinueItems().map(item => ({
-      ...item,
-      id: item.videoId,
-      name: item.name || item.videoId,
-      _progress: item.duration > 0 ? Math.round((item.position / item.duration) * 100) : 0,
-      updatedAt: item.updatedAt || 0,
-    }));
+    const localItems = getContinueItems().map(item => {
+      // For series, the videoId is an episode ID (e.g. tt1234567:1:2).
+      // Derive the series root ID so navigation goes to the series page.
+      let navId = item.videoId;
+      if (item.type === 'series') {
+        const parts = (item.videoId || '').split(':');
+        if (parts.length >= 3 && /^\d+$/.test(parts.at(-1)) && /^\d+$/.test(parts.at(-2))) {
+          navId = parts[0];
+        }
+      }
+      return {
+        ...item,
+        id: navId,
+        name: item.name || item.videoId,
+        _progress: item.duration > 0 ? Math.round((item.position / item.duration) * 100) : 0,
+        updatedAt: item.updatedAt || 0,
+      };
+    });
 
     const merged = new Map();
     for (const item of [...syncedItems, ...localItems]) {
@@ -64,10 +74,6 @@
 
     loadingContinue = false;
   });
-
-  function goToMeta(item) {
-    push(`/meta/${item.type}/${item.id}`);
-  }
 </script>
 
 <div class="board">
@@ -86,7 +92,7 @@
             meta={item}
             size="normal"
             defaultType={item.type || 'movie'}
-            on:click={() => goToMeta(item)}
+
           />
         {/each}
       </div>

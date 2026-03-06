@@ -51,7 +51,7 @@
     <p class="no-streams">No streams available{filterQuality !== 'all' ? ` for ${filterQuality}` : ''}.</p>
   {:else}
     <div class="stream-list">
-      {#each filtered as stream (stream._info.name + stream._info.desc)}
+      {#each filtered as stream, i (i)}
         <button
           class="stream-item"
           data-focusable="true"
