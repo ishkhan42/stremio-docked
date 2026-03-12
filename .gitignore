@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+*.log
+*.tmp
+*.cache
+*.bak
+*.swp
+.DS_Store
+package-lock.json
+yarn.lock
+.env
+.env.local
+.env.*.local
