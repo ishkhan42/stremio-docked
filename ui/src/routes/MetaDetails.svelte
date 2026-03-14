@@ -401,10 +401,10 @@
     {/if}
   {/if}
 
-  <!-- Stream picker modal -->
+  <!-- Stream picker sidebar -->
   {#if showStreamPicker}
-    <div class="modal-overlay" on:click|self={() => showStreamPicker = false} role="dialog">
-      <div class="modal-box">
+    <div class="drawer-overlay" on:click|self={() => showStreamPicker = false} role="dialog" tabindex="-1" on:keydown={(e) => e.key === 'Escape' && (showStreamPicker = false)}>
+      <aside class="drawer-box" aria-label="Stream selection">
         <StreamPicker
           streams={streams}
           loading={loadingStreams}
@@ -414,7 +414,7 @@
           on:select={handleStreamSelect}
           on:close={() => showStreamPicker = false}
         />
-      </div>
+      </aside>
     </div>
   {/if}
 </div>
@@ -608,25 +608,26 @@
     padding: 0 0 80px;
   }
 
-  /* ── Modal ──────────────────────────────────────────────────────────────────── */
-  .modal-overlay {
+  /* ── Stream Drawer ─────────────────────────────────────────────────────────── */
+  .drawer-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0,0,0,0.7);
+    background: rgba(0,0,0,0.54);
     display: flex;
-    align-items: center;
-    justify-content: center;
+    align-items: stretch;
+    justify-content: flex-end;
     z-index: 200;
-    backdrop-filter: blur(4px);
-    padding: 24px;
+    backdrop-filter: blur(2px);
   }
 
-  .modal-box {
-    width: 100%;
-    max-width: 700px;
-    max-height: 85vh;
+  .drawer-box {
+    width: min(560px, 92vw);
+    height: 100vh;
     overflow-y: auto;
-    border-radius: var(--radius);
+    padding: 92px 18px 20px;
+    border-left: 1px solid rgba(255,255,255,0.12);
+    background: linear-gradient(180deg, rgba(18,21,31,0.98) 0%, rgba(14,16,24,0.98) 100%);
+    box-shadow: -28px 0 50px rgba(0,0,0,0.35);
   }
 
   /* ── Loading / Error ─────────────────────────────────────────────────────────── */
@@ -670,6 +671,6 @@
     .btn-primary   { font-size: 1.08rem; padding: 15px 36px; }
     .btn-secondary { font-size: 1rem; padding: 15px 28px; }
     .back-btn      { font-size: 0.95rem; padding: 10px 14px; }
-    .modal-box     { max-width: 780px; }
+    .drawer-box    { width: min(620px, 88vw); padding: 96px 22px 26px; }
   }
 </style>

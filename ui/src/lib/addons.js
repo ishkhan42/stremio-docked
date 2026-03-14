@@ -221,6 +221,55 @@ export function parseStreamInfo(stream) {
     const desc = stream.description || stream.title || '';
     const combined = `${name} ${desc}`.toUpperCase();
 
+    const LANG_HINTS = [
+        ['ENG', 'en'], ['ENGLISH', 'en'], ['EN-US', 'en'], ['EN-GB', 'en'],
+        ['SPA', 'es'], ['SPANISH', 'es'], ['ESPANOL', 'es'],
+        ['POR', 'pt'], ['PORTUGUESE', 'pt'], ['PT-BR', 'pt'],
+        ['FRA', 'fr'], ['FRENCH', 'fr'],
+        ['DEU', 'de'], ['GERMAN', 'de'],
+        ['ITA', 'it'], ['ITALIAN', 'it'],
+        ['RUS', 'ru'], ['RUSSIAN', 'ru'],
+        ['UKR', 'uk'], ['UKRAINIAN', 'uk'],
+        ['POL', 'pl'], ['POLISH', 'pl'],
+        ['TUR', 'tr'], ['TURKISH', 'tr'],
+        ['ARA', 'ar'], ['ARABIC', 'ar'],
+        ['HIN', 'hi'], ['HINDI', 'hi'],
+        ['JPN', 'ja'], ['JAPANESE', 'ja'],
+        ['KOR', 'ko'], ['KOREAN', 'ko'],
+        ['CHI', 'zh'], ['CHINESE', 'zh'], ['MANDARIN', 'zh'],
+        ['NLD', 'nl'], ['DUTCH', 'nl'],
+        ['SWE', 'sv'], ['SWEDISH', 'sv'],
+        ['FIN', 'fi'], ['FINNISH', 'fi'],
+        ['NOR', 'no'], ['NORWEGIAN', 'no'],
+        ['DAN', 'da'], ['DANISH', 'da'],
+        ['CES', 'cs'], ['CZECH', 'cs'],
+        ['ELL', 'el'], ['GREEK', 'el'],
+        ['HEB', 'he'], ['HEBREW', 'he'],
+        ['RON', 'ro'], ['ROMANIAN', 'ro'],
+        ['HUN', 'hu'], ['HUNGARIAN', 'hu'],
+        ['IND', 'id'], ['INDONESIAN', 'id'],
+        ['THA', 'th'], ['THAI', 'th'],
+        ['VIE', 'vi'], ['VIETNAMESE', 'vi'],
+    ];
+
+    const audioLangs = [];
+    const seenLangs = new Set();
+    for (const [token, code] of LANG_HINTS) {
+        const regex = new RegExp(`(^|[^A-Z])${token}([^A-Z]|$)`);
+        if (regex.test(combined) && !seenLangs.has(code)) {
+            seenLangs.add(code);
+            audioLangs.push(code);
+        }
+    }
+
+    const hasEmbeddedSubs =
+        /(EMBEDDED\s*SUB|INTERNAL\s*SUB|MUXED\s*SUB|SOFTSUB|SOFT\s*SUB|MULTI\s*SUB)/.test(combined) ||
+        /\bSUBS?\b/.test(combined) ||
+        /\bCC\b/.test(combined);
+
+    const hasExplicitNoSubs = /(NO\s*SUB|SUBS?\s*NONE|WITHOUT\s*SUB)/.test(combined);
+    const subtitlesEmbedded = hasEmbeddedSubs && !hasExplicitNoSubs;
+
     const quality =
         combined.includes('2160') || combined.includes('4K') || combined.includes('UHD') ? '4K' :
             combined.includes('1080') ? '1080p' :
@@ -256,5 +305,16 @@ export function parseStreamInfo(stream) {
     const sizeMatch = desc.match(/💾\s*([\d.]+\s*(?:GB|MB))/i);
     const size = sizeMatch ? sizeMatch[1] : null;
 
-    return { quality, hdr, audio, codec, seeds, size, name: stream.name || '', desc };
+    return {
+        quality,
+        hdr,
+        audio,
+        codec,
+        seeds,
+        size,
+        name: stream.name || '',
+        desc,
+        audioLangs,
+        subtitlesEmbedded,
+    };
 }

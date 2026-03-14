@@ -105,16 +105,16 @@
   .season-tabs {
     display: flex;
     gap: 4px;
-    padding: 0 0 16px;
+    padding: 0 0 10px;
     flex-wrap: wrap;
   }
 
   .season-tab {
-    padding: 7px 18px;
+    padding: 5px 14px;
     border-radius: var(--radius-sm);
     background: var(--bg-elevated);
     color: var(--text-muted);
-    font-size: 0.88rem;
+    font-size: 0.8rem;
     font-weight: 500;
     border: 1px solid var(--border);
     transition: all var(--transition);
@@ -131,8 +131,8 @@
 
   .episode {
     display: flex;
-    gap: 16px;
-    padding: 12px 16px;
+    gap: 10px;
+    padding: 8px 10px;
     border-radius: var(--radius-sm);
     cursor: pointer;
     transition: background var(--transition);
@@ -147,8 +147,8 @@
 
   .ep-thumb {
     position: relative;
-    width: 160px;
-    min-width: 160px;
+    width: 118px;
+    min-width: 118px;
     aspect-ratio: 16/9;
     border-radius: 8px;
     overflow: hidden;
@@ -205,49 +205,49 @@
   }
 
   .ep-title {
-    font-size: 0.95rem;
+    font-size: 0.86rem;
     font-weight: 500;
-    margin-bottom: 4px;
+    margin-bottom: 2px;
     display: flex;
     align-items: center;
     gap: 8px;
   }
 
   .ep-num {
-    font-size: 0.78rem;
+    font-size: 0.7rem;
     background: var(--bg-elevated);
     border: 1px solid var(--border);
-    padding: 1px 7px;
+    padding: 1px 6px;
     border-radius: 4px;
     color: var(--text-muted);
     flex-shrink: 0;
   }
 
   .ep-date {
-    font-size: 0.78rem;
+    font-size: 0.72rem;
     color: var(--text-dim);
-    margin-bottom: 6px;
+    margin-bottom: 2px;
   }
 
   .ep-overview {
-    font-size: 0.82rem;
+    font-size: 0.74rem;
     color: var(--text-muted);
-    line-height: 1.5;
+    line-height: 1.35;
     display: -webkit-box;
-    -webkit-line-clamp: 2;
+    -webkit-line-clamp: 1;
     -webkit-box-orient: vertical;
     overflow: hidden;
   }
 
   /* ── TV-scale ──────────────────────────────── */
   @media (min-width: 960px) {
-    .season-tab    { padding: 9px 22px; font-size: 0.95rem; }
-    .episode       { padding: 14px 18px; gap: 20px; }
-    .ep-thumb      { width: 190px; min-width: 190px; }
-    .ep-title      { font-size: 1.02rem; }
-    .ep-num        { font-size: 0.82rem; padding: 2px 8px; }
-    .ep-date       { font-size: 0.82rem; }
-    .ep-overview   { font-size: 0.88rem; }
+    .season-tab    { padding: 7px 16px; font-size: 0.86rem; }
+    .episode       { padding: 10px 12px; gap: 12px; }
+    .ep-thumb      { width: 138px; min-width: 138px; }
+    .ep-title      { font-size: 0.9rem; }
+    .ep-num        { font-size: 0.74rem; padding: 1px 7px; }
+    .ep-date       { font-size: 0.75rem; }
+    .ep-overview   { font-size: 0.78rem; }
     .ep-progress   { height: 4px; }
   }
 </style>

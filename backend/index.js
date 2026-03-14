@@ -21,18 +21,36 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { execFile } = require('child_process');
-const { normalizeStreamUrl, extractHashFileFromPath, srtToVtt, normalizeLibraryItems } = require('./utils');
+const {
+    normalizeStreamUrl,
+    extractHashFileFromPath,
+    srtToVtt,
+    normalizeLibraryItems,
+    buildTimelineDiscontinuities,
+} = require('./utils');
 
 /** Run ffprobe and return parsed JSON. */
-function ffprobe(url, timeoutMs = 15000) {
+function ffprobe(input, options = {}) {
+    const timeoutMs = Number(options.timeoutMs || 15000);
+    const showPackets = !!options.showPackets;
+    const showFormat = !!options.showFormat;
+    const analyzeDuration = String(options.analyzeDuration || '2000000');
+    const probeSize = String(options.probeSize || '2000000');
+    const selectStreams = options.selectStreams ? String(options.selectStreams) : '';
+    const readIntervals = options.readIntervals ? String(options.readIntervals) : '';
+
     return new Promise((resolve, reject) => {
         const args = [
             '-v', 'quiet',
             '-print_format', 'json',
             '-show_streams',
-            '-analyzeduration', '2000000',  // 2s — just enough to read container headers
-            '-probesize', '2000000',        // 2MB
-            url,
+            ...(showPackets ? ['-show_packets'] : []),
+            ...(showFormat ? ['-show_format'] : []),
+            ...(selectStreams ? ['-select_streams', selectStreams] : []),
+            ...(readIntervals ? ['-read_intervals', readIntervals] : []),
+            '-analyzeduration', analyzeDuration,
+            '-probesize', probeSize,
+            input,
         ];
         execFile('/usr/bin/ffprobe', args, { timeout: timeoutMs, encoding: 'utf-8' }, (err, stdout) => {
             if (err) return reject(err);
@@ -57,6 +75,77 @@ const SYNC_MIN_INTERVAL_MS = 15000;
 const audioSessions = new Map();
 const prefetchJobs = new Map();
 const recentSyncLastAt = new Map();
+const playbackTelemetry = new Map();
+
+function telemetryKey(infoHash, fileIdx) {
+    return `${String(infoHash || '').toLowerCase()}:${Number(fileIdx || 0)}`;
+}
+
+function appendPlaybackTelemetry({ sessionId, infoHash, fileIdx, events = [] }) {
+    const hash = String(infoHash || '').toLowerCase();
+    if (!/^[a-f0-9]{40}$/i.test(hash)) return null;
+
+    const idx = Number(fileIdx || 0);
+    if (!Number.isInteger(idx) || idx < 0) return null;
+
+    const sid = String(sessionId || '').trim() || crypto.randomUUID();
+    const key = telemetryKey(hash, idx);
+    const existing = playbackTelemetry.get(key) || {
+        infoHash: hash,
+        fileIdx: idx,
+        sessions: {},
+        counters: {},
+        lastEventAt: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+    };
+
+    if (!existing.sessions[sid]) {
+        existing.sessions[sid] = {
+            id: sid,
+            counters: {},
+            lastEvents: [],
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+        };
+    }
+
+    const session = existing.sessions[sid];
+    const normalized = Array.isArray(events) ? events : [];
+    for (const evt of normalized) {
+        const type = String(evt?.type || '').trim().toLowerCase();
+        if (!type) continue;
+
+        existing.counters[type] = Number(existing.counters[type] || 0) + 1;
+        session.counters[type] = Number(session.counters[type] || 0) + 1;
+
+        const ts = Number(evt?.at || Date.now()) || Date.now();
+        const row = {
+            type,
+            at: ts,
+            data: evt?.data && typeof evt.data === 'object' ? evt.data : null,
+        };
+        session.lastEvents.push(row);
+        if (session.lastEvents.length > 40) {
+            session.lastEvents.splice(0, session.lastEvents.length - 40);
+        }
+
+        existing.lastEventAt = Math.max(existing.lastEventAt || 0, ts);
+    }
+
+    session.updatedAt = Date.now();
+    existing.updatedAt = Date.now();
+
+    // Keep telemetry map bounded.
+    if (!playbackTelemetry.has(key) && playbackTelemetry.size >= 120) {
+        const oldest = [...playbackTelemetry.entries()]
+            .sort((a, b) => (a[1].updatedAt || 0) - (b[1].updatedAt || 0))[0];
+        if (oldest) playbackTelemetry.delete(oldest[0]);
+    }
+
+    playbackTelemetry.set(key, existing);
+    return { key, sessionId: sid };
+}
 
 function safeSessionPath(sessionId) {
     return path.join(AUDIO_SWITCH_ROOT, sessionId);
@@ -168,6 +257,13 @@ function estimateCachePath(infoHash) {
     return /^[a-f0-9]{40}$/i.test(infoHash)
         ? path.join(STREMIO_CACHE_ROOT, infoHash.toLowerCase())
         : null;
+}
+
+function estimateCacheFilePath(infoHash, fileIdx) {
+    if (!/^[a-f0-9]{40}$/i.test(infoHash)) return null;
+    const idx = Number(fileIdx);
+    if (!Number.isInteger(idx) || idx < 0) return null;
+    return path.join(STREMIO_CACHE_ROOT, infoHash.toLowerCase(), String(idx));
 }
 
 async function removeDownloadArtifacts(infoHash) {
@@ -1313,6 +1409,125 @@ app.get('/server-status', async (req, res) => {
         });
     } catch (err) {
         res.json({ ok: false, error: err.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lightweight playback telemetry
+// POST /playback-telemetry
+// GET  /playback-telemetry?infoHash=X&fileIdx=Y
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post('/playback-telemetry', (req, res) => {
+    const sessionId = String(req.body?.sessionId || '');
+    const infoHash = String(req.body?.infoHash || '').toLowerCase();
+    const fileIdx = toNumber(req.body?.fileIdx, 0);
+    const events = Array.isArray(req.body?.events) ? req.body.events : [];
+
+    const result = appendPlaybackTelemetry({ sessionId, infoHash, fileIdx, events });
+    if (!result) return res.status(400).json({ error: 'Invalid telemetry payload' });
+    return res.json({ ok: true, sessionId: result.sessionId, accepted: events.length });
+});
+
+app.get('/playback-telemetry', (req, res) => {
+    const infoHash = String(req.query?.infoHash || '').toLowerCase();
+    const fileIdx = toNumber(req.query?.fileIdx, 0);
+    if (!/^[a-f0-9]{40}$/i.test(infoHash)) {
+        return res.status(400).json({ error: 'Invalid infoHash' });
+    }
+    if (!Number.isInteger(fileIdx) || fileIdx < 0) {
+        return res.status(400).json({ error: 'Invalid fileIdx' });
+    }
+
+    const key = telemetryKey(infoHash, fileIdx);
+    const row = playbackTelemetry.get(key);
+    if (!row) {
+        return res.json({ infoHash, fileIdx, sessions: [], counters: {}, updatedAt: 0 });
+    }
+
+    const sessions = Object.values(row.sessions || {})
+        .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+        .slice(0, 8)
+        .map((s) => ({
+            id: s.id,
+            counters: s.counters,
+            updatedAt: s.updatedAt,
+            lastEvents: (s.lastEvents || []).slice(-12),
+        }));
+
+    return res.json({
+        infoHash,
+        fileIdx,
+        counters: row.counters || {},
+        sessions,
+        createdAt: row.createdAt || 0,
+        updatedAt: row.updatedAt || 0,
+        lastEventAt: row.lastEventAt || 0,
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Media timeline diagnostics — packet timestamp discontinuity hints
+// GET /media-timeline?infoHash=X&fileIdx=Y&fromSec=0&windowSec=1200
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/media-timeline', async (req, res) => {
+    const infoHash = String(req.query?.infoHash || '').toLowerCase();
+    const fileIdx = toNumber(req.query?.fileIdx, 0);
+    const fromSec = Math.max(0, toNumber(req.query?.fromSec, 0));
+    const windowSec = Math.max(30, Math.min(3600, toNumber(req.query?.windowSec, 1200)));
+
+    if (!/^[a-f0-9]{40}$/i.test(infoHash)) {
+        return res.status(400).json({ error: 'Invalid infoHash' });
+    }
+    if (!Number.isInteger(fileIdx) || fileIdx < 0) {
+        return res.status(400).json({ error: 'Invalid fileIdx' });
+    }
+
+    const localPath = estimateCacheFilePath(infoHash, fileIdx);
+    const hasLocalFile = localPath
+        ? await fs.access(localPath).then(() => true).catch(() => false)
+        : false;
+    const input = hasLocalFile ? localPath : `${STREMIO_SERVER}/${infoHash}/${fileIdx}`;
+
+    // Read only a bounded forward window around the current playback position.
+    const readIntervals = `${fromSec}%+${windowSec}`;
+
+    try {
+        const data = await ffprobe(input, {
+            showPackets: true,
+            selectStreams: 'v:0',
+            readIntervals,
+            analyzeDuration: '20000000',
+            probeSize: '20000000',
+            timeoutMs: hasLocalFile ? 20000 : 12000,
+        });
+
+        const packets = Array.isArray(data?.packets) ? data.packets : [];
+        const discontinuities = buildTimelineDiscontinuities(packets, {
+            backwardJumpSec: 0.04,
+            forwardGapSec: 0.9,
+            hopPaddingSec: 0.12,
+        }).map((item) => ({
+            type: item.type,
+            atSec: Number(item.atSec.toFixed(3)),
+            deltaSec: Number(item.deltaSec.toFixed(3)),
+            resumeAtSec: Number(item.resumeAtSec.toFixed(3)),
+        }));
+
+        res.setHeader('Cache-Control', hasLocalFile ? 'public, max-age=300' : 'no-store');
+        return res.json({
+            infoHash,
+            fileIdx,
+            source: hasLocalFile ? 'local-cache' : 'stream',
+            fromSec,
+            windowSec,
+            scannedPackets: packets.length,
+            discontinuities,
+        });
+    } catch (err) {
+        console.warn('[media-timeline] ffprobe failed for', infoHash, fileIdx, err.message);
+        return res.status(500).json({ error: `Failed to inspect media timeline: ${err.message}` });
     }
 });
 

@@ -83,6 +83,8 @@
     const rawVideoId = String(item?.videoId || '');
     const videoParts = rawVideoId.split(':');
     const looksEpisodeId = videoParts.length >= 3 && /\d+/.test(videoParts.at(-1) || '') && /\d+/.test(videoParts.at(-2) || '');
+    const episodeSeason = looksEpisodeId ? Number(videoParts.at(-2)) : null;
+    const episodeNumber = looksEpisodeId ? Number(videoParts.at(-1)) : null;
 
     const infoHash = String(item?.infoHash || inferredHash || '').toLowerCase();
     const fileIdx = Number.isFinite(Number(item?.fileIdx)) ? Number(item.fileIdx) : inferredFileIdx;
@@ -100,9 +102,34 @@
       fileIdx,
       type: kind,
       metaId,
+      episodeSeason,
+      episodeNumber,
       displayName: name,
       displayVideoId: item?.videoId || `${kind}:${shortHash(infoHash)}:${fileIdx}`,
     };
+  }
+
+  function typeLabel(kind) {
+    const t = String(kind || '').toLowerCase();
+    if (t === 'series') return 'TV Series';
+    if (t === 'movie') return 'Movie';
+    return 'Video';
+  }
+
+  function episodeLabel(item) {
+    if (!Number.isInteger(item?.episodeSeason) || !Number.isInteger(item?.episodeNumber)) return '';
+    return `S${item.episodeSeason}E${item.episodeNumber}`;
+  }
+
+  function statusLabel(rawStatus) {
+    const s = String(rawStatus || '').toLowerCase();
+    if (s === 'running') return 'Downloading';
+    if (s === 'starting' || s === 'queued') return 'Preparing';
+    if (s === 'done' || s === 'completed') return 'Ready to Play';
+    if (s === 'incomplete') return 'Needs Re-download';
+    if (s === 'failed') return 'Failed';
+    if (s === 'stopped') return 'Stopped';
+    return 'Unknown';
   }
 
   async function hydrateMissingMeta(list) {
@@ -262,9 +289,9 @@
 
               <div>
                 <h2 class="name">{item.displayName}</h2>
-                <p class="meta">{item.type || 'video'} · {item.status || 'unknown'} · File {item.fileIdx ?? 0}</p>
-                <p class="meta small">{item.displayVideoId}</p>
-                <p class="meta small">Hash {shortHash(item.infoHash)}</p>
+                <p class="meta">{typeLabel(item.type)}{#if episodeLabel(item)} · {episodeLabel(item)}{/if} · {statusLabel(item.status)}</p>
+                <p class="meta small">Source File #{item.fileIdx ?? 0}</p>
+                <p class="meta small">Torrent {shortHash(item.infoHash)}</p>
                 <p class="meta small">Updated {formatDate(item.updatedAt)}</p>
               </div>
               <div class="actions">

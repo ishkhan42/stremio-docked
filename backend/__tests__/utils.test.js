@@ -9,6 +9,7 @@ import {
     extractHashFileFromPath,
     srtToVtt,
     normalizeLibraryItems,
+    buildTimelineDiscontinuities,
 } from '../utils.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -207,5 +208,59 @@ describe('normalizeLibraryItems', () => {
     it('returns empty array for null/undefined', () => {
         expect(normalizeLibraryItems(null)).toEqual([]);
         expect(normalizeLibraryItems(undefined)).toEqual([]);
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// buildTimelineDiscontinuities
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('buildTimelineDiscontinuities', () => {
+    it('detects forward timestamp gaps', () => {
+        const packets = [
+            { dts_time: '0.00', pts_time: '0.00' },
+            { dts_time: '0.04', pts_time: '0.04' },
+            { dts_time: '0.08', pts_time: '0.08' },
+            { dts_time: '2.30', pts_time: '2.30' },
+        ];
+        const result = buildTimelineDiscontinuities(packets, { forwardGapSec: 0.9 });
+        expect(result).toHaveLength(1);
+        expect(result[0].type).toBe('forward-gap');
+        expect(result[0].atSec).toBeCloseTo(0.08, 3);
+        expect(result[0].resumeAtSec).toBeGreaterThan(2.30);
+    });
+
+    it('detects backward jumps', () => {
+        const packets = [
+            { dts_time: '9.20' },
+            { dts_time: '9.24' },
+            { dts_time: '8.10' },
+        ];
+        const result = buildTimelineDiscontinuities(packets);
+        expect(result).toHaveLength(1);
+        expect(result[0].type).toBe('backward-jump');
+        expect(result[0].deltaSec).toBeLessThan(0);
+    });
+
+    it('returns empty for monotonic packet sequence', () => {
+        const packets = [
+            { dts_time: '10.00' },
+            { dts_time: '10.04' },
+            { dts_time: '10.08' },
+            { dts_time: '10.12' },
+        ];
+        expect(buildTimelineDiscontinuities(packets)).toEqual([]);
+    });
+
+    it('merges clustered anomalies into one hint', () => {
+        const packets = [
+            { dts_time: '15.00' },
+            { dts_time: '15.04' },
+            { dts_time: '15.60' }, // forward gap
+            { dts_time: '15.20' }, // backward jump nearby
+        ];
+        const result = buildTimelineDiscontinuities(packets, { forwardGapSec: 0.4 });
+        expect(result).toHaveLength(1);
+        expect(result[0].atSec).toBeCloseTo(15.04, 2);
     });
 });

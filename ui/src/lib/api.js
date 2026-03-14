@@ -114,6 +114,41 @@ export async function getMediaInfo(infoHash, fileIdx = 0) {
 }
 
 /**
+ * Read timeline discontinuity hints from backend packet analysis.
+ */
+export async function getMediaTimeline(infoHash, fileIdx = 0, fromSec = 0, windowSec = 1200) {
+    const params = new URLSearchParams({
+        infoHash: String(infoHash || ''),
+        fileIdx: String(fileIdx),
+        fromSec: String(Math.max(0, Number(fromSec) || 0)),
+        windowSec: String(Math.max(30, Number(windowSec) || 1200)),
+    });
+    return call(`/media-timeline?${params.toString()}`);
+}
+
+/**
+ * Send lightweight playback telemetry events (best-effort).
+ */
+export async function sendPlaybackTelemetry({ sessionId, infoHash, fileIdx = 0, events = [] }) {
+    if (!infoHash || !Array.isArray(events) || events.length === 0) return { ok: false, skipped: true };
+    return call('/playback-telemetry', {
+        method: 'POST',
+        body: JSON.stringify({ sessionId, infoHash, fileIdx, events }),
+    });
+}
+
+/**
+ * Read aggregated playback telemetry for one file.
+ */
+export async function getPlaybackTelemetry(infoHash, fileIdx = 0) {
+    const params = new URLSearchParams({
+        infoHash: String(infoHash || ''),
+        fileIdx: String(fileIdx),
+    });
+    return call(`/playback-telemetry?${params.toString()}`);
+}
+
+/**
  * Create a server-side audio-switch playback URL for a selected track.
  * Uses remux (copy) first, then audio-only transcode fallback on backend.
  */

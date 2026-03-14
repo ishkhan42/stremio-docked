@@ -7,6 +7,7 @@
   import {
     subtitleProxyUrl,
     getMediaInfo,
+    getMediaTimeline,
     createAudioSwitchUrl,
     startStreamPrefetch,
     stopStreamPrefetch,
@@ -14,6 +15,8 @@
     getDownloads,
     startBackgroundDownload,
     syncRecentlyPlayed,
+    sendPlaybackTelemetry,
+    getPlaybackTelemetry,
   } from '../lib/api.js';
   import { prefs } from '../stores/progress.js';
 
@@ -109,6 +112,7 @@
   let recoveryStep = 0;
   let lastProgressAt = 0;
   let stallHintAt = 0;
+  let bufferingDelayTimer;
   let prefetchSessionId = '';
   let prefetchStats = null;
   let prefetchPollTimer;
@@ -118,6 +122,22 @@
   let backgroundDownloadQueued = false;
   let lastSyncedAt = 0;
   let lastSyncedPos = 0;
+  let timelineHints = [];
+  let timelineHintCursor = 0;
+  let timelineHintLoading = false;
+  let timelineHintWindowStart = -1;
+  let timelineHintWindowSec = 1200;
+  let timelineHintLastAt = 0;
+  let lastProactiveHopAt = 0;
+  let suppressSpinnerUntil = 0;
+  let telemetrySessionId = '';
+  let telemetryQueue = [];
+  let telemetryFlushTimer;
+  let showDiagnostics = false;
+  let diagnosticsFetchBusy = false;
+  let diagnosticsRemote = null;
+  let diagnosticsRefreshTimer;
+  let telemetryLocalCounters = {};
 
   // Controls visibility
   let showControls   = true;
@@ -242,12 +262,82 @@
     return groups;
   }
 
+  function initTelemetrySession() {
+    const fallback = `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+    telemetrySessionId = globalThis?.crypto?.randomUUID?.() || fallback;
+  }
+
+  function queueTelemetry(type, data = null) {
+    if (!infoHash) return;
+    const eventType = String(type || '').trim().toLowerCase();
+    if (!eventType) return;
+    telemetryLocalCounters = {
+      ...telemetryLocalCounters,
+      [eventType]: Number(telemetryLocalCounters[eventType] || 0) + 1,
+    };
+    telemetryQueue.push({
+      type: eventType,
+      at: Date.now(),
+      data: data && typeof data === 'object' ? data : null,
+    });
+    if (telemetryQueue.length > 80) {
+      telemetryQueue.splice(0, telemetryQueue.length - 80);
+    }
+  }
+
+  async function flushTelemetry(force = false) {
+    if (!infoHash || !telemetryQueue.length) return;
+    const batchSize = force ? telemetryQueue.length : Math.min(12, telemetryQueue.length);
+    const chunk = telemetryQueue.splice(0, batchSize);
+    try {
+      await sendPlaybackTelemetry({
+        sessionId: telemetrySessionId,
+        infoHash,
+        fileIdx,
+        events: chunk,
+      });
+    } catch {
+      telemetryQueue = chunk.concat(telemetryQueue).slice(0, 120);
+    }
+  }
+
+  async function refreshDiagnosticsRemote() {
+    if (!showDiagnostics || !infoHash || diagnosticsFetchBusy) return;
+    diagnosticsFetchBusy = true;
+    try {
+      diagnosticsRemote = await getPlaybackTelemetry(infoHash, fileIdx);
+    } catch {
+      // hidden panel best-effort only
+    } finally {
+      diagnosticsFetchBusy = false;
+    }
+  }
+
+  function toggleDiagnostics() {
+    showDiagnostics = !showDiagnostics;
+    if (!showDiagnostics) {
+      clearInterval(diagnosticsRefreshTimer);
+      diagnosticsRefreshTimer = null;
+      return;
+    }
+    refreshDiagnosticsRemote();
+    clearInterval(diagnosticsRefreshTimer);
+    diagnosticsRefreshTimer = setInterval(() => {
+      refreshDiagnosticsRemote();
+    }, 6000);
+  }
+
   // ── Lifecycle ──────────────────────────────────────────────────────────────
   onMount(() => {
+    initTelemetrySession();
     document.addEventListener('keydown', handleKey, { capture: true });
     document.addEventListener('fullscreenchange', onFullscreenChange);
     hydrateDownloadedState();
     setupPlayer();
+    queueTelemetry('player-mounted', { downloaded: !!isDownloaded, streamType });
+    telemetryFlushTimer = setInterval(() => {
+      flushTelemetry(false);
+    }, 10000);
 
     // In parallel: fetch track info via ffprobe if it's a torrent stream
     if (infoHash) {
@@ -295,6 +385,11 @@
     clearTimeout(controlTimer);
     clearTimeout(feedbackTimer);
     clearTimeout(statusHintTimer);
+    clearTimeout(bufferingDelayTimer);
+    clearInterval(telemetryFlushTimer);
+    clearInterval(diagnosticsRefreshTimer);
+    queueTelemetry('player-destroyed', { pos: Math.round(currentTime || 0) });
+    flushTelemetry(true);
   });
 
   // ── Player setup ──────────────────────────────────────────────────────────
@@ -321,6 +416,15 @@
     clearInterval(stallWatchTimer);
     stopPrefetch();
     cleanupHls();
+    clearTimeout(bufferingDelayTimer);
+    buffering = false;
+    suppressSpinnerUntil = 0;
+    timelineHints = [];
+    timelineHintCursor = 0;
+    timelineHintWindowStart = -1;
+    timelineHintLastAt = 0;
+    lastProactiveHopAt = 0;
+    queueTelemetry('player-setup', { downloaded: effectiveDownloaded, hasDirect: !!direct, hasHlsFallback: !!hlsFallback });
 
     const isHlsManifest = direct && /\.m3u8($|\?)/i.test(direct);
 
@@ -513,7 +617,7 @@
   function rollbackToDirectPlayback(resumeTime = 0, hintMsg = '') {
     const direct = normalizePlayableUrl(streamUrl || directUrl);
     if (!videoEl || !direct) {
-      buffering = false;
+      setBuffering(false);
       if (hintMsg) showStatusHint(hintMsg);
       return;
     }
@@ -526,7 +630,7 @@
     timelineOffsetSec = 0;
     timelineBaseDuration = 0;
     hlsFailed = false;
-    buffering = false;
+    setBuffering(false);
     pendingAudioSwitch = null;
     stopPrefetch();
 
@@ -604,25 +708,149 @@
     }
   }
 
+  function setBuffering(active, options = {}) {
+    const immediate = !!options.immediate;
+    const delayMs = Math.max(0, Number(options.delayMs ?? 260));
+    clearTimeout(bufferingDelayTimer);
+    if (!active) {
+      buffering = false;
+      queueTelemetry('buffering-hidden');
+      return;
+    }
+    if (immediate) {
+      buffering = true;
+      queueTelemetry('buffering-visible', { immediate: true });
+      return;
+    }
+
+    if (Date.now() < suppressSpinnerUntil) return;
+
+    bufferingDelayTimer = setTimeout(() => {
+      buffering = true;
+      queueTelemetry('buffering-visible', { immediate: false, delayMs });
+    }, delayMs);
+  }
+
+  async function loadTimelineHints(fromSec = 0, force = false) {
+    if (!infoHash || !videoEl || usingHls || audioSwitchSession || !effectiveDownloaded) return;
+    if (timelineHintLoading) return;
+
+    const now = Date.now();
+    if (!force && now - timelineHintLastAt < 4000) return;
+    if (!force && timelineHintWindowStart >= 0) {
+      const end = timelineHintWindowStart + timelineHintWindowSec;
+      if (fromSec >= timelineHintWindowStart + 15 && fromSec <= end - 120) {
+        return;
+      }
+    }
+
+    timelineHintLoading = true;
+    timelineHintLastAt = now;
+    try {
+      const windowStart = Math.max(0, Math.floor(fromSec));
+      const res = await getMediaTimeline(infoHash, fileIdx, windowStart, timelineHintWindowSec);
+      const hints = Array.isArray(res?.discontinuities) ? res.discontinuities : [];
+      timelineHintWindowStart = Number(res?.fromSec ?? windowStart) || windowStart;
+      timelineHints = hints
+        .filter((h) => Number.isFinite(h?.atSec) && Number.isFinite(h?.resumeAtSec))
+        .sort((a, b) => a.atSec - b.atSec);
+      const mediaNow = videoEl.currentTime || 0;
+      timelineHintCursor = timelineHints.findIndex((h) => h.resumeAtSec > mediaNow + 0.02);
+      if (timelineHintCursor < 0) timelineHintCursor = timelineHints.length;
+      queueTelemetry('timeline-hints-loaded', {
+        fromSec: timelineHintWindowStart,
+        count: timelineHints.length,
+        scannedPackets: Number(res?.scannedPackets || 0),
+        source: String(res?.source || ''),
+      });
+    } catch (err) {
+      console.warn('[player] timeline hint fetch failed:', err.message);
+      queueTelemetry('timeline-hints-failed', { reason: err.message || 'unknown' });
+    } finally {
+      timelineHintLoading = false;
+    }
+  }
+
+  function applyTimelineGuard() {
+    if (!videoEl || usingHls || audioSwitchSession || !effectiveDownloaded) return;
+    if (!timelineHints.length || timelineHintCursor >= timelineHints.length) return;
+    if (videoEl.paused || videoEl.seeking) return;
+
+    const now = Date.now();
+    if (now - lastProactiveHopAt < 1200) return;
+
+    const mediaNow = videoEl.currentTime || 0;
+    while (timelineHintCursor < timelineHints.length && timelineHints[timelineHintCursor].resumeAtSec <= mediaNow + 0.02) {
+      timelineHintCursor += 1;
+    }
+    if (timelineHintCursor >= timelineHints.length) return;
+
+    const next = timelineHints[timelineHintCursor];
+    const eta = next.atSec - mediaNow;
+    if (eta > 0.32 || eta < -0.2) return;
+
+    let target = Math.max(next.resumeAtSec, mediaNow + 0.08);
+    if (Number.isFinite(videoEl.duration) && videoEl.duration > 0) {
+      target = Math.min(videoEl.duration - 0.2, target);
+    }
+
+    if (target > mediaNow + 0.03) {
+      lastProactiveHopAt = now;
+      timelineHintCursor += 1;
+      videoEl.currentTime = target;
+      videoEl.play().catch(() => {});
+      setBuffering(false);
+      suppressSpinnerUntil = Date.now() + 900;
+      queueTelemetry('proactive-hop', {
+        etaSec: Number(eta.toFixed(3)),
+        fromSec: Number(mediaNow.toFixed(3)),
+        toSec: Number(target.toFixed(3)),
+        hintAtSec: Number(next.atSec.toFixed(3)),
+      });
+    }
+  }
+
+  function maybeRefreshTimelineHints() {
+    if (!videoEl || usingHls || audioSwitchSession || !effectiveDownloaded) return;
+    if (!timelineHints.length && !timelineHintLoading) {
+      loadTimelineHints(Math.max(0, (videoEl.currentTime || 0) - 2), true);
+      return;
+    }
+    if (timelineHintWindowStart < 0) return;
+
+    const mediaNow = videoEl.currentTime || 0;
+    const end = timelineHintWindowStart + timelineHintWindowSec;
+    if (mediaNow > end - 150) {
+      loadTimelineHints(Math.max(0, mediaNow - 8), true);
+    }
+  }
+
   // ── Video events ──────────────────────────────────────────────────────────
-  function onPlay()    { playing = true;  buffering = false; clearTimeout(switchRollbackTimer); startStallWatchdog(); }
+  function onPlay() {
+    playing = true;
+    setBuffering(false);
+    clearTimeout(switchRollbackTimer);
+    startStallWatchdog();
+  }
   function onPause() {
     playing = false;
+    setBuffering(false);
     stopStallWatchdog();
     syncPlaybackProgress(true);
   }
   function onWaiting() {
-    buffering = true;
+    queueTelemetry('waiting-event', { bufferedAhead: Number(bufferedAhead.toFixed(3)) });
+    setBuffering(true, { delayMs: effectiveDownloaded ? 700 : 260 });
     if (!videoEl || usingHls || audioSwitchSession) return;
     const classification = classifyStall();
     if (classification === 'decode-gap' || !canStartPrefetch()) {
-      attemptStallRecovery('waiting');
+      attemptStallRecovery('waiting', { silent: effectiveDownloaded });
     } else if (classification === 'network-starvation') {
       startPrefetch();
     }
   }
   function onPlaying() {
-    buffering = false;
+    setBuffering(false);
     playing = true;
     clearTimeout(switchRollbackTimer);
     startStallWatchdog();
@@ -630,10 +858,11 @@
   }
 
   function onStalled() {
-    buffering = true;
+    queueTelemetry('stalled-event', { bufferedAhead: Number(bufferedAhead.toFixed(3)) });
+    setBuffering(true, { delayMs: effectiveDownloaded ? 700 : 260 });
     const classification = classifyStall();
     if (classification === 'decode-gap' || !canStartPrefetch()) {
-      attemptStallRecovery('stalled');
+      attemptStallRecovery('stalled', { silent: effectiveDownloaded });
     } else if (classification === 'network-starvation') {
       maybeShowStallHint('Buffer underrun detected. Waiting for network/data…');
       startPrefetch();
@@ -729,9 +958,10 @@
     showStatusHint(msg);
   }
 
-  function attemptStallRecovery(source = 'watchdog') {
+  function attemptStallRecovery(source = 'watchdog', options = {}) {
     if (!videoEl || usingHls || audioSwitchSession) return;
     if (videoEl.paused || videoEl.seeking) return;
+    const silent = !!options.silent;
 
     const now = Date.now();
     if (now - lastRecoveryAt < 1400) return;
@@ -780,11 +1010,20 @@
 
     if (target > current + 0.01) {
       videoEl.currentTime = target;
-      buffering = true;
+      setBuffering(true, { immediate: !silent });
       videoEl.play().catch(() => {});
-      showStatusHint(source === 'stalled'
-        ? 'Decode gap detected. Auto-hopping to next keyframe…'
-        : 'Timeline discontinuity detected. Applying smart skip…');
+      suppressSpinnerUntil = Date.now() + (silent ? 900 : 250);
+      queueTelemetry('reactive-recovery', {
+        source,
+        silent,
+        fromSec: Number(current.toFixed(3)),
+        toSec: Number(target.toFixed(3)),
+      });
+      if (!silent) {
+        showStatusHint(source === 'stalled'
+          ? 'Decode gap detected. Auto-hopping to next keyframe…'
+          : 'Timeline discontinuity detected. Applying smart skip…');
+      }
     }
   }
 
@@ -839,6 +1078,7 @@
         if (prefetchSessionId) {
           stopPrefetch();
         }
+        loadTimelineHints(Math.max(0, (videoEl?.currentTime || 0) - 2), true);
       }
     } catch {
       // best-effort detection only
@@ -982,6 +1222,9 @@
         if (videoEl.audioTracks[i].enabled) { currentAudioTrack = i; break; }
       }
     }
+    if (effectiveDownloaded && !usingHls && !audioSwitchSession) {
+      loadTimelineHints(Math.max(0, (videoEl.currentTime || 0) - 2), true);
+    }
     videoEl.play().catch(() => {});
   }
 
@@ -989,6 +1232,11 @@
     const mediaTime = videoEl.currentTime || 0;
     currentTime = audioSwitchSession ? (timelineOffsetSec + mediaTime) : mediaTime;
     updateBufferedAhead();
+    applyTimelineGuard();
+
+    if (effectiveDownloaded && !usingHls && !audioSwitchSession) {
+      maybeRefreshTimelineHints();
+    }
   }
 
   function onProgress() {
@@ -1284,6 +1532,13 @@
     if (matchKey(e, 'RW'))   { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(-30); return; }
     const seekForwardKey = matchKey(e, 'RIGHT') || e.key === '>' || (e.code === 'Period' && e.shiftKey);
     const seekBackwardKey = matchKey(e, 'LEFT') || e.key === '<' || (e.code === 'Comma' && e.shiftKey);
+    const diagnosticsToggle = e.key === 'i' || e.key === 'I' || (e.code === 'KeyI');
+    if (diagnosticsToggle) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      toggleDiagnostics();
+      return;
+    }
     if (seekForwardKey && !activePanel) { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(5);  return; }
     if (seekBackwardKey && !activePanel) { e.preventDefault(); e.stopImmediatePropagation(); seekRelative(-5); return; }
     if (matchKey(e, 'UP'))   { e.preventDefault(); e.stopImmediatePropagation(); setVolume(volume + 0.1); return; }
@@ -1371,6 +1626,36 @@
         </svg>
       {/if}
     </div>
+  {/if}
+
+  {#if showDiagnostics}
+    <aside class="diag-panel" on:click|stopPropagation>
+      <div class="diag-head">
+        <p class="diag-title">Diagnostics</p>
+        <button class="diag-close" data-focusable="true" on:click={toggleDiagnostics}>Hide</button>
+      </div>
+      <p class="diag-line">Session {telemetrySessionId.slice(0, 8)} · Mode {usingHls ? 'HLS' : 'Direct'} · {effectiveDownloaded ? 'Downloaded' : 'Streaming'}</p>
+      <p class="diag-line">Pos {Math.round(currentTime)}s · Buf {Math.round(bufferedAhead)}s · Queue {telemetryQueue.length}</p>
+      <p class="diag-subtitle">Local counters</p>
+      <div class="diag-grid">
+        {#if Object.keys(telemetryLocalCounters).length === 0}
+          <span class="diag-pill">No events</span>
+        {:else}
+          {#each Object.entries(telemetryLocalCounters) as [name, count]}
+            <span class="diag-pill">{name}: {count}</span>
+          {/each}
+        {/if}
+      </div>
+      {#if diagnosticsRemote?.counters}
+        <p class="diag-subtitle">Backend counters</p>
+        <div class="diag-grid">
+          {#each Object.entries(diagnosticsRemote.counters) as [name, count]}
+            <span class="diag-pill remote">{name}: {count}</span>
+          {/each}
+        </div>
+      {/if}
+      <p class="diag-hint">Toggle with I</p>
+    </aside>
   {/if}
 
   <!-- ───────────── Controls ──────────────────────────────────────────────── -->
@@ -1762,6 +2047,66 @@
     70%  { opacity: 1; transform: translate(-50%,-50%) scale(1);    }
     100% { opacity: 0; transform: translate(-50%,-50%) scale(0.92); }
   }
+
+  .diag-panel {
+    position: absolute;
+    top: 84px;
+    left: 22px;
+    width: min(520px, calc(100vw - 44px));
+    max-height: 52vh;
+    overflow: auto;
+    z-index: 45;
+    padding: 12px 13px;
+    border-radius: 10px;
+    background: rgba(8, 11, 18, 0.9);
+    border: 1px solid rgba(255,255,255,0.17);
+    backdrop-filter: blur(4px);
+  }
+  .diag-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 6px;
+  }
+  .diag-title { margin: 0; font-size: 0.9rem; font-weight: 700; color: rgba(255,255,255,0.94); }
+  .diag-close {
+    border-radius: 999px;
+    padding: 4px 10px;
+    border: 1px solid rgba(255,255,255,0.22);
+    color: rgba(255,255,255,0.9);
+    background: rgba(255,255,255,0.06);
+    font-size: 0.72rem;
+    font-weight: 700;
+  }
+  .diag-line { margin: 0 0 4px; font-size: 0.76rem; color: rgba(255,255,255,0.82); }
+  .diag-subtitle {
+    margin: 10px 0 6px;
+    font-size: 0.72rem;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.66);
+  }
+  .diag-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .diag-pill {
+    display: inline-flex;
+    border-radius: 999px;
+    padding: 4px 9px;
+    font-size: 0.72rem;
+    color: rgba(214, 232, 255, 0.94);
+    border: 1px solid rgba(145, 187, 255, 0.28);
+    background: rgba(36, 67, 117, 0.3);
+  }
+  .diag-pill.remote {
+    color: rgba(204, 255, 221, 0.94);
+    border-color: rgba(111, 245, 165, 0.28);
+    background: rgba(18, 92, 58, 0.3);
+  }
+  .diag-hint { margin: 10px 0 0; font-size: 0.7rem; color: rgba(255,255,255,0.52); }
 
   /* ── Controls layer ──────────────────────────────────────────────────────── */
   .controls {

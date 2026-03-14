@@ -1,6 +1,7 @@
 <script>
   import { createEventDispatcher } from 'svelte';
   import { parseStreamInfo } from '../lib/addons.js';
+  import { getMediaInfo } from '../lib/api.js';
 
   export let streams = [];
   export let loading = false;
@@ -8,14 +9,27 @@
   const dispatch = createEventDispatcher();
 
   let filterQuality = 'all';
+  let diagnosticsByKey = {};
+  let diagnosticsReqSeq = 0;
 
   const qualityOptions = ['all', '4K', '1080p', '720p', '480p'];
 
-  $: parsed = streams.map(s => ({ ...s, _info: parseStreamInfo(s) }));
+  $: parsed = streams
+    .map((s, i) => ({ ...s, _info: parseStreamInfo(s), _originalIndex: i }))
+    .sort((a, b) => {
+      const sa = Number.isFinite(a?._info?.seeds) ? Number(a._info.seeds) : -1;
+      const sb = Number.isFinite(b?._info?.seeds) ? Number(b._info.seeds) : -1;
+      if (sb !== sa) return sb - sa;
+      return a._originalIndex - b._originalIndex;
+    });
 
   $: filtered = filterQuality === 'all'
     ? parsed
     : parsed.filter(s => s._info.quality === filterQuality);
+
+  $: if (parsed.length) {
+    hydrateDiagnostics(parsed);
+  }
 
   function pickStream(stream) {
     dispatch('select', stream);
@@ -26,6 +40,125 @@
     if (seeds > 50) return 'var(--green)';
     if (seeds > 10) return 'var(--yellow)';
     return 'var(--red)';
+  }
+
+  function extractTorrentRef(stream) {
+    const hash = String(stream?.infoHash || '').toLowerCase();
+    const idx = Number(stream?.fileIdx || 0);
+    if (/^[a-f0-9]{40}$/i.test(hash)) {
+      return { infoHash: hash, fileIdx: Number.isInteger(idx) && idx >= 0 ? idx : 0 };
+    }
+
+    const urlStr = String(stream?.url || '');
+    if (!urlStr) return null;
+    try {
+      const u = new URL(urlStr, window.location.origin);
+      const m = u.pathname.match(/^\/([a-f0-9]{40})\/(\d+)(?:\/.*)?$/i);
+      if (!m) return null;
+      return { infoHash: m[1].toLowerCase(), fileIdx: Number(m[2]) || 0 };
+    } catch {
+      return null;
+    }
+  }
+
+  function diagKey(ref) {
+    if (!ref) return '';
+    return `${ref.infoHash}:${ref.fileIdx}`;
+  }
+
+  async function hydrateDiagnostics(rows) {
+    const seq = ++diagnosticsReqSeq;
+    const refs = rows
+      .map(extractTorrentRef)
+      .filter(Boolean);
+    const keys = [...new Set(refs.map(diagKey).filter(Boolean))];
+    if (!keys.length) return;
+
+    for (const key of keys) {
+      if (diagnosticsByKey[key] || seq !== diagnosticsReqSeq) continue;
+      const [infoHash, fileIdxStr] = key.split(':');
+      try {
+        const info = await getMediaInfo(infoHash, Number(fileIdxStr || 0));
+        if (seq !== diagnosticsReqSeq) return;
+        diagnosticsByKey = {
+          ...diagnosticsByKey,
+          [key]: {
+            audio: Array.isArray(info?.audio) ? info.audio : [],
+            subtitles: Array.isArray(info?.subtitles) ? info.subtitles : [],
+          },
+        };
+      } catch {
+        if (seq !== diagnosticsReqSeq) return;
+        diagnosticsByKey = { ...diagnosticsByKey, [key]: { audio: [], subtitles: [] } };
+      }
+    }
+  }
+
+  const FLAG_BY_LANG = {
+    en: 'US', eng: 'US',
+    es: 'ES', spa: 'ES',
+    pt: 'PT', por: 'PT',
+    fr: 'FR', fra: 'FR',
+    de: 'DE', deu: 'DE',
+    it: 'IT', ita: 'IT',
+    ru: 'RU', rus: 'RU',
+    uk: 'UA', ukr: 'UA',
+    pl: 'PL', pol: 'PL',
+    tr: 'TR', tur: 'TR',
+    ar: 'SA', ara: 'SA',
+    hi: 'IN', hin: 'IN',
+    ja: 'JP', jpn: 'JP',
+    ko: 'KR', kor: 'KR',
+    zh: 'CN', zho: 'CN', cmn: 'CN',
+    nl: 'NL', nld: 'NL',
+    sv: 'SE', swe: 'SE',
+    fi: 'FI', fin: 'FI',
+    no: 'NO', nor: 'NO',
+    da: 'DK', dan: 'DK',
+    cs: 'CZ', ces: 'CZ',
+    el: 'GR', ell: 'GR',
+    he: 'IL', heb: 'IL',
+    ro: 'RO', ron: 'RO', rum: 'RO',
+    hu: 'HU', hun: 'HU',
+    id: 'ID', ind: 'ID',
+    th: 'TH', tha: 'TH',
+    vi: 'VN', vie: 'VN',
+  };
+
+  function toFlagEmoji(countryCode) {
+    const cc = String(countryCode || '').toUpperCase();
+    if (!/^[A-Z]{2}$/.test(cc)) return '🌐';
+    const codePoints = [...cc].map((c) => 127397 + c.charCodeAt(0));
+    return String.fromCodePoint(...codePoints);
+  }
+
+  function audioFlagSummary(stream) {
+    const hinted = Array.isArray(stream?._info?.audioLangs) ? stream._info.audioLangs : [];
+    if (hinted.length) {
+      return [...new Set(hinted)].slice(0, 5).map((lang) => ({
+        lang,
+        flag: toFlagEmoji(FLAG_BY_LANG[lang] || FLAG_BY_LANG[String(lang).slice(0, 2)] || ''),
+      }));
+    }
+
+    const ref = extractTorrentRef(stream);
+    if (!ref) return [];
+    const diag = diagnosticsByKey[diagKey(ref)];
+    if (!diag?.audio?.length) return [];
+    const langs = [...new Set(diag.audio.map((a) => String(a?.language || '').toLowerCase()).filter(Boolean))];
+    return langs.slice(0, 5).map((lang) => ({
+      lang,
+      flag: toFlagEmoji(FLAG_BY_LANG[lang] || FLAG_BY_LANG[lang.slice(0, 2)] || ''),
+    }));
+  }
+
+  function subtitleCount(stream) {
+    if (stream?._info?.subtitlesEmbedded) return 1;
+
+    const ref = extractTorrentRef(stream);
+    if (!ref) return 0;
+    const diag = diagnosticsByKey[diagKey(ref)];
+    return Array.isArray(diag?.subtitles) ? diag.subtitles.length : 0;
   }
 </script>
 
@@ -70,6 +203,14 @@
               {/if}
               {#if stream._info.audio}
                 <span class="badge audio">{stream._info.audio}</span>
+              {/if}
+              {#if audioFlagSummary(stream).length}
+                <span class="badge audio-langs" title="Embedded audio tracks">
+                  Audio {audioFlagSummary(stream).map((x) => x.flag).join(' ')}
+                </span>
+              {/if}
+              {#if subtitleCount(stream) > 0}
+                <span class="badge subs">Subs {subtitleCount(stream)}</span>
               {/if}
             </div>
 
@@ -192,6 +333,8 @@
   .badge.hdr      { background: rgba(6,182,212,0.15); color: var(--cyan); border: 1px solid rgba(6,182,212,0.3); }
   .badge.codec    { background: rgba(255,255,255,0.06); color: var(--text-muted); border: 1px solid var(--border); }
   .badge.audio    { background: rgba(34,197,94,0.1); color: var(--green); border: 1px solid rgba(34,197,94,0.2); }
+  .badge.audio-langs { background: rgba(16,185,129,0.12); color: #9af4d0; border: 1px solid rgba(16,185,129,0.24); }
+  .badge.subs { background: rgba(56,189,248,0.16); color: #93dbff; border: 1px solid rgba(56,189,248,0.28); }
 
   .stream-name {
     font-size: 0.88rem;
